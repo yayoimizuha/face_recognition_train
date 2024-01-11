@@ -1,0 +1,28 @@
+Copyright (c) 2023, Anjith George, Christophe Ecabert, Hatef Otroshi Shahreza, Ketan Kotwal, Sébastien Marcel
+Idiap Research Institute, Martigny 1920, Switzerland.
+
+All rights reserved.
+
+This software and associated documentation files (the "Software") are provided for use only in connection with the “Efficient Face Recognition Competition at IJCB 2023” competition, and solely for non-commercial purposes. Any redistribution, commercial use, or use outside of the “Efficient Face Recognition Competition at IJCB 2023” competition is strictly prohibited without prior written permission from the copyright holders.
+
+You may use the Software for the duration of the ““Efficient Face Recognition Competition at IJCB 2023” competition, and for a period of 3 months thereafter, provided that the following conditions are met:
+
+1. Redistributions of the Software are not allowed.
+
+2. The copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+3. Any works or derivatives based on the Software must not be used for commercial purposes or redistributed without prior written permission from the copyright holders.
+
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
