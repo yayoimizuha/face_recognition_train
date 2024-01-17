@@ -44,21 +44,23 @@ import torch
 from torchvision import transforms
 from face_alignment import align
 from backbones import get_model
-name="edgeface_s_gamma_05" # or edgeface_xs_gamma_06
-model=get_model(name)
+arch="edgeface_s_gamma_05" # or edgeface_xs_gamma_06
+model=get_model(arch)
 
 transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ])
 
-checkpoint_path='path_to_checkpint'
-model.load_state_dict(torch.load(checkpoint_path)['state_dict']).eval()
-
-path = 'path_to_face_image'
+checkpoint_path='checkpoints/{arch}.pth''
+model.load_state_dict(torch.load(checkpoint_path))
+model.eval()
+path = 'checkpoints/synthface.jpeg''
 aligned = align.get_aligned_face(path)
-transformed_input = transform(aligned)
+transformed_input = transform(aligned).unsqueeze(0)
 embedding = model(transformed_input)
+print(embedding.shape)
+
 ```
 
 
