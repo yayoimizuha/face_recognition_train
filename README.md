@@ -52,10 +52,10 @@ transform = transforms.Compose([
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ])
 
-checkpoint_path='checkpoints/{arch}.pth''
+checkpoint_path='checkpoints/{arch}.pth'
 model.load_state_dict(torch.load(checkpoint_path))
 model.eval()
-path = 'checkpoints/synthface.jpeg''
+path = 'checkpoints/synthface.jpeg'
 aligned = align.get_aligned_face(path)
 transformed_input = transform(aligned).unsqueeze(0)
 embedding = model(transformed_input)
