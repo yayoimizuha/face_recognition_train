@@ -60,8 +60,8 @@ transform = transforms.Compose([
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ])
 
-checkpoint_path='checkpoints/{arch}.pth'
-model.load_state_dict(torch.load(checkpoint_path))
+checkpoint_path='checkpoints/{arch}.pt'
+model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
 model.eval()
 path = 'checkpoints/synthface.jpeg'
 aligned = align.get_aligned_face(path)
