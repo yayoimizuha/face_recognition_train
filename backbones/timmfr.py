@@ -76,3 +76,16 @@ def get_timmfrv2(model_name, **kwargs):
     Create an instance of TimmFRWrapperV2 with the specified `model_name` and additional arguments passed as `kwargs`.
     """
     return TimmFRWrapperV2(model_name=model_name, **kwargs)
+
+
+
+# class Edge512(nn.Module):
+#     """THIS MAINTAINS ACCURACY WITH LOW EMBEDDING DIMENSIONS"""
+#     def __init__(self, model_name='edgenext_xx_small'):
+#         super().__init__()
+#         self.model = timm.create_model(model_name)
+#         self.model.reset_classifier(512)
+    
+#     def forward(self, x):
+#         x = self.model(x)
+#         return x

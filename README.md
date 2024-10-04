@@ -50,9 +50,9 @@ The following code shows how to use the model for inference:
 ```python
 import torch
 from torchvision import transforms
-from face_alignment import align
+# from face_alignment import align
 from backbones import get_model
-arch="edgeface_s_gamma_05" # or edgeface_xs_gamma_06
+arch="edgeface_xxs_q"# or "edgeface_s_gamma_05" # or edgeface_xs_gamma_06
 model=get_model(arch)
 
 transform = transforms.Compose([
@@ -60,7 +60,7 @@ transform = transforms.Compose([
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ])
 
-checkpoint_path='checkpoints/{arch}.pt'
+checkpoint_path=f'checkpoints/{arch}.pt'
 model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
 model.eval()
 path = 'checkpoints/synthface.jpeg'
