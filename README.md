@@ -50,9 +50,9 @@ The following code shows how to use the model for inference:
 ```python
 import torch
 from torchvision import transforms
-# from face_alignment import align
+from face_alignment import align
 from backbones import get_model
-arch="edgeface_xxs_q"# or "edgeface_s_gamma_05" # or edgeface_xs_gamma_06
+arch="edgeface_base"# or "edgeface_s_gamma_05" # or edgeface_xs_gamma_06
 model=get_model(arch)
 
 transform = transforms.Compose([
@@ -123,7 +123,30 @@ torchrun --nproc_per_node=4 train_v2_restart.py configs/edgeface_xs_gamma_06_res
 ```
 
 
+# EdgeFace Models via `torch.hub`
 
-Please note that you need to replace the output folders and paths based on your setup.
+## Available Models
+
+- `edgeface_base`
+- `edgeface_xs_gamma_06`
+- `edgeface_xs_q`
+- `edgeface_xxs`
+- `edgeface_xxs_q`
+- `edgeface_s_gamma_05`
+
+## Usage
+
+You can load the models using `torch.hub` as follows:
+
+```python
+import torch
+
+# Replace with your actual GitLab repository URL
+repo = 'https://gitlab.idiap.ch/bob/bob.paper.tbiom2023_edgeface.git'
+
+# Load a model
+model = torch.hub.load(repo, 'edgeface_xs_gamma_06', source='github', pretrained=True)
+model.eval()
+
 
 > :warning: **Note About the License:** Please refer to the `LICENSE` file in the parent directory for information about the license terms and conditions.
