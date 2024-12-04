@@ -140,12 +140,8 @@ You can load the models using `torch.hub` as follows:
 
 ```python
 import torch
-
-# Replace with your actual GitLab repository URL
-repo = 'https://gitlab.idiap.ch/bob/bob.paper.tbiom2023_edgeface.git'
-
-# Load a model
-model = torch.hub.load(repo, 'edgeface_xs_gamma_06', source='github', pretrained=True)
+variant='edgeface_xs_gamma_06'
+model = torch.hub.load('otroshi/edgeface', variant, source='github', pretrained=True)
 model.eval()
 
 
