@@ -1,0 +1,40 @@
+[project]
+name = "face-recognition-train"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "Pillow",
+    "tqdm",
+    "torch",
+    "torchvision",
+    "scikit-learn",
+    "scikit-image",
+    "onnxruntime-gpu",
+    "onnx",
+    "pandas",
+    "opencv-python",
+    "timm",
+    "easydict",
+    "nvidia-dali-cuda120",
+    "ptflops",
+    "menpo",
+    "prettytable"
+]
+
+[[tool.uv.index]]
+name = "torch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pypi-nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "torch-cu128" }]
+torchvision = [{ index = "torch-cu128" }]
+nvidia-dali-cuda120 = [{ index = "pypi-nvidia" }]
