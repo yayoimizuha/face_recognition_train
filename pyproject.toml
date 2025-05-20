@@ -18,7 +18,7 @@ dependencies = [
     "opencv-python",
     "timm",
     "easydict",
-    "nvidia-dali-cuda120",
+    "nvidia-dali-cuda120;sys_platform != 'win32'",
     "ptflops",
     "menpo",
     "prettytable"
