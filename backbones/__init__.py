@@ -35,3 +35,6 @@ def get_model(name, **kwargs):
         return replace_linear_with_lowrank_2(get_timmfrv2('edgenext_small', batchnorm=False), rank_ratio=0.5)
     else:
         raise ValueError()
+
+# add MobileFaceNet Backbone
+# https://github.com/deepinsight/insightface/blob/master/recognition/arcface_torch/backbones/mobilefacenet.py
