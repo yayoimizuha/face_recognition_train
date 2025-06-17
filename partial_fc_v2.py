@@ -1,4 +1,3 @@
-
 import math
 from typing import Callable
 
@@ -29,12 +28,12 @@ class PartialFC_V2(torch.nn.Module):
     _version = 2
 
     def __init__(
-        self,
-        margin_loss: Callable,
-        embedding_size: int,
-        num_classes: int,
-        sample_rate: float = 1.0,
-        fp16: bool = False,
+            self,
+            margin_loss: Callable,
+            embedding_size: int,
+            num_classes: int,
+            sample_rate: float = 1.0,
+            fp16: bool = False,
     ):
         """
         Paramenters:
@@ -104,9 +103,9 @@ class PartialFC_V2(torch.nn.Module):
         return self.weight[self.weight_index]
 
     def forward(
-        self,
-        local_embeddings: torch.Tensor,
-        local_labels: torch.Tensor,
+            self,
+            local_embeddings: torch.Tensor,
+            local_labels: torch.Tensor,
     ):
         """
         Parameters:
@@ -144,7 +143,7 @@ class PartialFC_V2(torch.nn.Module):
 
         labels = labels.view(-1, 1)
         index_positive = (self.class_start <= labels) & (
-            labels < self.class_start + self.num_local
+                labels < self.class_start + self.num_local
         )
         labels[~index_positive] = -1
         labels[index_positive] -= self.class_start
@@ -154,7 +153,7 @@ class PartialFC_V2(torch.nn.Module):
         else:
             weight = self.weight
 
-        with torch.cuda.amp.autocast(self.fp16):
+        with torch.amp.autocast(device_type="cuda", enabled=self.fp16):
             norm_embeddings = normalize(embeddings)
             norm_weight_activated = normalize(weight)
             logits = linear(norm_embeddings, norm_weight_activated)

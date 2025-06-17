@@ -1,8 +1,13 @@
+import os
+
+from dotenv import load_dotenv, find_dotenv
 from easydict import EasyDict as edict
 
 # make training faster
 # our RAM is 256G
 # mount -t tmpfs -o size=140G  tmpfs /train_tmp
+
+_ = load_dotenv(find_dotenv())
 
 config = edict()
 
@@ -37,7 +42,7 @@ config.verbose = 2000
 config.frequent = 10
 
 # For Large Sacle Dataset, such as WebFace42M
-config.dali = False 
+config.dali = False
 config.dali_aug = False
 
 # Gradient ACC
@@ -50,11 +55,12 @@ config.seed = 2048
 config.num_workers = 2
 
 # WandB Logger
-config.wandb_key = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+config.wandb_key = os.environ["WANDB_API_KEY"]
 config.suffix_run_name = None
-config.using_wandb = False
-config.wandb_entity = "entity"
-config.wandb_project = "project"
+config.using_wandb = True
+config.wandb_entity = os.environ["WANDB_ENTITY"]
+config.wandb_project = os.environ["WANDB_PROJECT"]
 config.wandb_log_all = True
 config.save_artifacts = False
-config.wandb_resume = False # resume wandb run: Only if the you wand t resume the last run that it was interrupted
+config.wandb_resume = False  # resume wandb run: Only if the you wand t resume the last run that it was interrupted
+config.notes = "Training various FaceNets with new codebase and dataset and algorithms."

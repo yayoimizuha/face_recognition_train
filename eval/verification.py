@@ -27,12 +27,14 @@
 import datetime
 import os
 import pickle
+from io import BytesIO
 
-import mxnet as mx
+# import mxnet as mx
 import numpy as np
 import sklearn
 import torch
-from mxnet import ndarray as nd
+from PIL import Image
+# from mxnet import ndarray as nd
 from scipy import interpolate
 from sklearn.decomposition import PCA
 from sklearn.model_selection import KFold
@@ -148,7 +150,13 @@ def calculate_val(thresholds,
             _, far_train[threshold_idx] = calculate_val_far(
                 threshold, dist[train_set], actual_issame[train_set])
         if np.max(far_train) >= far_target:
-            f = interpolate.interp1d(far_train, thresholds, kind='slinear')
+            sorted_indices = np.argsort(far_train)
+            x_sorted = far_train[sorted_indices]
+            y_sorted = thresholds[sorted_indices]
+            for i in range(1, len(x_sorted)):
+                if x_sorted[i] <= x_sorted[i - 1]:
+                    x_sorted[i] = x_sorted[i - 1] + 1e-9
+            f = interpolate.interp1d(x_sorted, y_sorted, kind='slinear')
             threshold = f(far_target)
         else:
             threshold = 0.0
@@ -196,32 +204,71 @@ def evaluate(embeddings, actual_issame, nrof_folds=10, pca=0):
                                       nrof_folds=nrof_folds)
     return tpr, fpr, accuracy, val, val_std, far
 
+
 @torch.no_grad()
 def load_bin(path, image_size):
-    try:
-        with open(path, 'rb') as f:
-            bins, issame_list = pickle.load(f)  # py2
-    except UnicodeDecodeError as e:
-        with open(path, 'rb') as f:
-            bins, issame_list = pickle.load(f, encoding='bytes')  # py3
+    with open(path, 'rb') as f:
+        bins, issame_list = pickle.load(f, encoding='bytes')
+
     data_list = []
-    for flip in [0, 1]:
+    for _ in range(2):
         data = torch.empty((len(issame_list) * 2, 3, image_size[0], image_size[1]))
         data_list.append(data)
-    for idx in range(len(issame_list) * 2):
-        _bin = bins[idx]
-        img = mx.image.imdecode(_bin)
-        if img.shape[1] != image_size[0]:
-            img = mx.image.resize_short(img, image_size[0])
-        img = nd.transpose(img, axes=(2, 0, 1))
-        for flip in [0, 1]:
-            if flip == 1:
-                img = mx.ndarray.flip(data=img, axis=2)
-            data_list[flip][idx][:] = torch.from_numpy(img.asnumpy())
-        if idx % 1000 == 0:
-            print('loading bin', idx)
-    print(data_list[0].shape)
+
+    for i in range(len(issame_list) * 2):
+        _bin = bins[i]
+
+        img = Image.open(BytesIO(_bin)).convert('RGB')
+        w, h = img.size
+        short_side = min(w, h)
+        if short_side != image_size[0]:
+            scale = image_size[0] / short_side
+            new_w, new_h = int(w * scale), int(h * scale)
+            img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+
+        for flip_idx, do_flip in enumerate([False, True]):
+            img_to_process = img
+            if do_flip:
+                img_to_process = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+
+            img_np = np.array(img_to_process, dtype=np.uint8)
+            img_np = img_np.transpose((2, 0, 1))
+
+            data_list[flip_idx][i][:] = torch.from_numpy(img_np.copy())
+
+        if (i + 1) % 1000 == 0:
+            print(f'loading bin... {i + 1}')
+
+    print(f"Final tensor shape: {data_list[0].shape}")
     return data_list, issame_list
+
+
+# @torch.no_grad()
+# def load_bin(path, image_size):
+#     try:
+#         with open(path, 'rb') as f:
+#             bins, issame_list = pickle.load(f)  # py2
+#     except UnicodeDecodeError as e:
+#         with open(path, 'rb') as f:
+#             bins, issame_list = pickle.load(f, encoding='bytes')  # py3
+#     data_list = []
+#     for flip in [0, 1]:
+#         data = torch.empty((len(issame_list) * 2, 3, image_size[0], image_size[1]))
+#         data_list.append(data)
+#     for idx in range(len(issame_list) * 2):
+#         _bin = bins[idx]
+#         img = mx.image.imdecode(_bin)
+#         if img.shape[1] != image_size[0]:
+#             img = mx.image.resize_short(img, image_size[0])
+#         img = nd.transpose(img, axes=(2, 0, 1))
+#         for flip in [0, 1]:
+#             if flip == 1:
+#                 img = mx.ndarray.flip(data=img, axis=2)
+#             data_list[flip][idx][:] = torch.from_numpy(img.asnumpy())
+#         if idx % 1000 == 0:
+#             print('loading bin', idx)
+#     print(data_list[0].shape)
+#     return data_list, issame_list
 
 @torch.no_grad()
 def test(data_set, backbone, batch_size, nfolds=10):
@@ -273,52 +320,51 @@ def test(data_set, backbone, batch_size, nfolds=10):
     acc2, std2 = np.mean(accuracy), np.std(accuracy)
     return acc1, std1, acc2, std2, _xnorm, embeddings_list
 
-
-def dumpR(data_set,
-          backbone,
-          batch_size,
-          name='',
-          data_extra=None,
-          label_shape=None):
-    print('dump verification embedding..')
-    data_list = data_set[0]
-    issame_list = data_set[1]
-    embeddings_list = []
-    time_consumed = 0.0
-    for i in range(len(data_list)):
-        data = data_list[i]
-        embeddings = None
-        ba = 0
-        while ba < data.shape[0]:
-            bb = min(ba + batch_size, data.shape[0])
-            count = bb - ba
-
-            _data = nd.slice_axis(data, axis=0, begin=bb - batch_size, end=bb)
-            time0 = datetime.datetime.now()
-            if data_extra is None:
-                db = mx.io.DataBatch(data=(_data,), label=(_label,))
-            else:
-                db = mx.io.DataBatch(data=(_data, _data_extra),
-                                     label=(_label,))
-            model.forward(db, is_train=False)
-            net_out = model.get_outputs()
-            _embeddings = net_out[0].asnumpy()
-            time_now = datetime.datetime.now()
-            diff = time_now - time0
-            time_consumed += diff.total_seconds()
-            if embeddings is None:
-                embeddings = np.zeros((data.shape[0], _embeddings.shape[1]))
-            embeddings[ba:bb, :] = _embeddings[(batch_size - count):, :]
-            ba = bb
-        embeddings_list.append(embeddings)
-    embeddings = embeddings_list[0] + embeddings_list[1]
-    embeddings = sklearn.preprocessing.normalize(embeddings)
-    actual_issame = np.asarray(issame_list)
-    outname = os.path.join('temp.bin')
-    with open(outname, 'wb') as f:
-        pickle.dump((embeddings, issame_list),
-                    f,
-                    protocol=pickle.HIGHEST_PROTOCOL)
+# def dumpR(data_set,
+#           backbone,
+#           batch_size,
+#           name='',
+#           data_extra=None,
+#           label_shape=None):
+#     print('dump verification embedding..')
+#     data_list = data_set[0]
+#     issame_list = data_set[1]
+#     embeddings_list = []
+#     time_consumed = 0.0
+#     for i in range(len(data_list)):
+#         data = data_list[i]
+#         embeddings = None
+#         ba = 0
+#         while ba < data.shape[0]:
+#             bb = min(ba + batch_size, data.shape[0])
+#             count = bb - ba
+#
+#             _data = nd.slice_axis(data, axis=0, begin=bb - batch_size, end=bb)
+#             time0 = datetime.datetime.now()
+#             if data_extra is None:
+#                 db = mx.io.DataBatch(data=(_data,), label=(_label,))
+#             else:
+#                 db = mx.io.DataBatch(data=(_data, _data_extra),
+#                                      label=(_label,))
+#             model.forward(db, is_train=False)
+#             net_out = model.get_outputs()
+#             _embeddings = net_out[0].asnumpy()
+#             time_now = datetime.datetime.now()
+#             diff = time_now - time0
+#             time_consumed += diff.total_seconds()
+#             if embeddings is None:
+#                 embeddings = np.zeros((data.shape[0], _embeddings.shape[1]))
+#             embeddings[ba:bb, :] = _embeddings[(batch_size - count):, :]
+#             ba = bb
+#         embeddings_list.append(embeddings)
+#     embeddings = embeddings_list[0] + embeddings_list[1]
+#     embeddings = sklearn.preprocessing.normalize(embeddings)
+#     actual_issame = np.asarray(issame_list)
+#     outname = os.path.join('temp.bin')
+#     with open(outname, 'wb') as f:
+#         pickle.dump((embeddings, issame_list),
+#                     f,
+#                     protocol=pickle.HIGHEST_PROTOCOL)
 
 
 # if __name__ == '__main__':

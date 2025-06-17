@@ -12,14 +12,14 @@ from torch import distributed
 
 
 class CallBackVerification(object):
-    
+
     def __init__(self, val_targets, rec_prefix, summary_writer=None, image_size=(112, 112), wandb_logger=None):
         self.rank: int = distributed.get_rank()
         self.highest_acc: float = 0.0
         self.highest_acc_list: List[float] = [0.0] * len(val_targets)
         self.ver_list: List[object] = []
         self.ver_name_list: List[str] = []
-        if self.rank is 0:
+        if self.rank == 0:
             self.init_dataset(val_targets=val_targets, data_dir=rec_prefix, image_size=image_size)
 
         self.summary_writer = summary_writer
@@ -59,14 +59,14 @@ class CallBackVerification(object):
                 self.ver_name_list.append(name)
 
     def __call__(self, num_update, backbone: torch.nn.Module):
-        if self.rank is 0 and num_update > 0:
+        if self.rank == 0 and num_update > 0:
             backbone.eval()
             self.ver_test(backbone, num_update)
             backbone.train()
 
 
 class CallBackLogging(object):
-    def __init__(self, frequent, total_step, batch_size, start_step=0,writer=None):
+    def __init__(self, frequent, total_step, batch_size, start_step=0, writer=None):
         self.frequent: int = frequent
         self.rank: int = distributed.get_rank()
         self.world_size: int = distributed.get_world_size()
@@ -94,14 +94,14 @@ class CallBackLogging(object):
                 except ZeroDivisionError:
                     speed_total = float('inf')
 
-                #time_now = (time.time() - self.time_start) / 3600
-                #time_total = time_now / ((global_step + 1) / self.total_step)
-                #time_for_end = time_total - time_now
+                # time_now = (time.time() - self.time_start) / 3600
+                # time_total = time_now / ((global_step + 1) / self.total_step)
+                # time_for_end = time_total - time_now
                 time_now = time.time()
                 time_sec = int(time_now - self.time_start)
                 time_sec_avg = time_sec / (global_step - self.start_step + 1)
                 eta_sec = time_sec_avg * (self.total_step - global_step - 1)
-                time_for_end = eta_sec/3600
+                time_for_end = eta_sec / 3600
                 if self.writer is not None:
                     self.writer.add_scalar('time_for_end', time_for_end, global_step)
                     self.writer.add_scalar('learning_rate', learning_rate, global_step)

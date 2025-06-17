@@ -24,6 +24,8 @@ import sys
 assert torch.__version__ >= "1.12.0", "In order to enjoy the features of the new torch, \
 we have upgraded the torch to 1.12.0. torch before than 1.12.0 may not work in the future."
 
+
+
 try:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -42,7 +44,6 @@ except KeyError:
 
 
 def main(args):
-
     # get config
     cfg = get_config(args.config)
     # global control random seed
@@ -58,7 +59,7 @@ def main(args):
         if rank == 0
         else None
     )
-    
+
     wandb_logger = None
     if cfg.using_wandb:
         import wandb
@@ -73,12 +74,12 @@ def main(args):
         run_name = run_name if cfg.suffix_run_name is None else run_name + f"_{cfg.suffix_run_name}"
         try:
             wandb_logger = wandb.init(
-                entity = cfg.wandb_entity, 
-                project = cfg.wandb_project, 
-                sync_tensorboard = True,
+                entity=cfg.wandb_entity,
+                project=cfg.wandb_project,
+                sync_tensorboard=True,
                 resume=cfg.wandb_resume,
-                name = run_name, 
-                notes = cfg.notes) if rank == 0 or cfg.wandb_log_all else None
+                name=run_name,
+                notes=cfg.notes) if rank == 0 or cfg.wandb_log_all else None
             if wandb_logger:
                 wandb_logger.config.update(cfg)
         except Exception as e:
@@ -161,19 +162,19 @@ def main(args):
         logging.info(": " + key + " " * num_space + str(value))
 
     callback_verification = CallBackVerification(
-        val_targets=cfg.val_targets, rec_prefix=cfg.rec, 
-        summary_writer=summary_writer, wandb_logger = wandb_logger
+        val_targets=cfg.val_targets, rec_prefix=cfg.rec,
+        summary_writer=summary_writer, wandb_logger=wandb_logger
     )
     callback_logging = CallBackLogging(
         frequent=cfg.frequent,
         total_step=cfg.total_step,
         batch_size=cfg.batch_size,
-        start_step = global_step,
+        start_step=global_step,
         writer=summary_writer
     )
 
     loss_am = AverageMeter()
-    amp = torch.cuda.amp.grad_scaler.GradScaler(growth_interval=100)
+    amp = torch.amp.GradScaler(device="cuda", growth_interval=100)
 
     for epoch in range(start_epoch, cfg.num_epoch):
 
@@ -208,7 +209,7 @@ def main(args):
                         'Process/Step': global_step,
                         'Process/Epoch': epoch
                     })
-                    
+
                 loss_am.update(loss.item(), 1)
                 callback_logging(global_step, loss_am, epoch, cfg.fp16, lr_scheduler.get_last_lr()[0], amp)
 
@@ -235,20 +236,19 @@ def main(args):
                 model = wandb.Artifact(artifact_name, type='model')
                 model.add_file(path_module)
                 wandb_logger.log_artifact(model)
-                
+
         if cfg.dali:
             train_loader.reset()
 
     if rank == 0:
         path_module = os.path.join(cfg.output, "model.pt")
         torch.save(backbone.module.state_dict(), path_module)
-        
+
         if wandb_logger and cfg.save_artifacts:
             artifact_name = f"{run_name}_Final"
             model = wandb.Artifact(artifact_name, type='model')
             model.add_file(path_module)
             wandb_logger.log_artifact(model)
-
 
 
 if __name__ == "__main__":
