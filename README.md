@@ -1,10 +1,4 @@
-# EdgeFace: Efficient Face Recognition Model for Edge Devices
-
-Official gitlab repository for EdgeFace: Efficient Face Recognition Model for Edge Devices 
-published in IEEE Transactions on Biometrics, Behavior, and Identity Science.
-
-
-
+# Clean-upped Face Recognition model training Repository 
 ## Installation Instructions
 
 ### Use uv
@@ -54,16 +48,4 @@ torchrun --nproc_per_node=4 train_v2_restart.py configs/edgeface_xs_gamma_06_res
 - `edgeface_xxs`
 - `edgeface_xxs_q`
 - `edgeface_s_gamma_05`
-
-## Usage
-
-You can load the models using `torch.hub` as follows:
-
-```python
-import torch
-variant='edgeface_xs_gamma_06'
-model = torch.hub.load('otroshi/edgeface', variant, source='github', pretrained=True)
-model.eval()
-
-
-> :warning: **Note About the License:** Please refer to the `LICENSE` file in the parent directory for information about the license terms and conditions.
+- `resnet50k`
