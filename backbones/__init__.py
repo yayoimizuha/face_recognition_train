@@ -31,6 +31,10 @@ def get_model(name, **kwargs):
         return get_timmfrv2('edgenext_xx_small', batchnorm=False)
     elif name == 'edgeface_base':
         return get_timmfrv2('edgenext_base', batchnorm=False)
+    elif name == 'mobilenetv4_conv_medium':
+        return get_timmfrv2('mobilenetv4_conv_medium', batchnorm=False)
+    elif name == 'mobilenetv4_hybrid_medium':
+        return get_timmfrv2('mobilenetv4_hybrid_medium', batchnorm=False)
     elif name == 'edgeface_xxs_q':
         model = get_timmfrv2('edgenext_xx_small', batchnorm=False)
         model = torch.quantization.quantize_dynamic(model, qconfig_spec={torch.nn.Linear}, dtype=torch.qint8)

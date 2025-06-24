@@ -24,8 +24,6 @@ import sys
 assert torch.__version__ >= "1.12.0", "In order to enjoy the features of the new torch, \
 we have upgraded the torch to 1.12.0. torch before than 1.12.0 may not work in the future."
 
-
-
 try:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -61,7 +59,7 @@ def main(args):
     )
 
     wandb_logger = None
-    if cfg.using_wandb:
+    if cfg.using_wandb and rank == 0:
         import wandb
         # Sign in to wandb
         try:
