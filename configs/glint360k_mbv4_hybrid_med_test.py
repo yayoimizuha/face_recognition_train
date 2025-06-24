@@ -6,7 +6,7 @@ from easydict import EasyDict as edict
 
 config = edict()
 config.margin_list = (1.0, 0.0, 0.4)
-config.network = "mobilenetv4_conv_medium"
+config.network = "mobilenetv4_hybrid_medium"
 config.resume = False
 config.output = None
 config.embedding_size = 512
