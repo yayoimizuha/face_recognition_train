@@ -11,7 +11,7 @@ located in the parent directory of this source code repository.
 For inquiries, please contact the author at anjith.george@idiap.ch
 ===============================================================================
 """
-from .timmfr import get_timmfrv2, replace_linear_with_lowrank_2
+from .timmfr import get_timmfrv2, replace_linear_with_lowrank_2, replace_activation_function
 from .iresnet import iresnet18, iresnet34, iresnet50, iresnet100, iresnet200
 from .mobilefacenet import get_mbf
 
@@ -35,6 +35,10 @@ def get_model(name, **kwargs):
         return get_timmfrv2('mobilenetv4_conv_medium', batchnorm=False)
     elif name == 'mobilenetv4_hybrid_medium':
         return get_timmfrv2('mobilenetv4_hybrid_medium', batchnorm=False)
+    elif name == 'mobilenetv4_hybrid_medium_silu':
+        model = get_timmfrv2('mobilenetv4_hybrid_medium', batchnorm=False)
+        replace_activation_function(model, torch.nn.ReLU, torch.nn.SiLU)
+        return model
     elif name == 'tf_efficientnetv2_b2':
         return get_timmfrv2('tf_efficientnetv2_b2', batchnorm=False)
     elif name == 'edgeface_xxs_q':
