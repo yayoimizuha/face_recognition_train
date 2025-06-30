@@ -41,8 +41,8 @@ def get_model(name, **kwargs):
         return model
     elif name == 'tf_efficientnetv2_b2':
         return get_timmfrv2('tf_efficientnetv2_b2', batchnorm=False)
-    elif name == 'convnext_nano':
-        return get_timmfrv2("convnext_nano.in12k", pretrained=True)
+    elif name == 'convnext_pico':
+        return get_timmfrv2("convnextv2_pico.fcmae_ft_in1k", pretrained=True)
     elif name == 'edgeface_xxs_q':
         model = get_timmfrv2('edgenext_xx_small', batchnorm=False)
         model = torch.quantization.quantize_dynamic(model, qconfig_spec={torch.nn.Linear}, dtype=torch.qint8)

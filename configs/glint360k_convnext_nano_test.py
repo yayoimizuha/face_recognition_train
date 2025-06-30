@@ -6,7 +6,7 @@ from easydict import EasyDict as edict
 
 config = edict()
 config.margin_list = (1.0, 0.0, 0.4)
-config.network = "convnext_nano"
+config.network = "convnext_pico"
 config.resume = False
 config.output = None
 config.embedding_size = 512
