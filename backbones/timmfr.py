@@ -53,6 +53,7 @@ def replace_linear_with_lowrank_2(model, rank_ratio=0.2):
     replace_linear_with_lowrank_recursive_2(model, rank_ratio)
     return model
 
+
 def replace_activation_function(model: nn.Module, before, after):
     for name, module in model.named_children():
         if isinstance(module, before):
@@ -60,17 +61,18 @@ def replace_activation_function(model: nn.Module, before, after):
         else:
             replace_activation_function(module, before, after)
 
+
 class TimmFRWrapperV2(nn.Module):
     """
     Wraps timm model
     """
 
-    def __init__(self, model_name='edgenext_x_small', featdim=512, batchnorm=False):
+    def __init__(self, model_name='edgenext_x_small', featdim=512, batchnorm=False, pretrained=True):
         super().__init__()
         self.featdim = featdim
         self.model_name = model_name
 
-        self.model = timm.create_model(self.model_name)
+        self.model = timm.create_model(self.model_name, pretrained=pretrained)
         self.model.reset_classifier(self.featdim)
 
     def forward(self, x):

@@ -226,7 +226,7 @@ def main(args):
             torch.save(checkpoint, os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
 
         if rank == 0:
-            path_module = os.path.join(cfg.output, "model.pt")
+            path_module = os.path.join(cfg.output, f"model_{epoch}.pt")
             torch.save(backbone.module.state_dict(), path_module)
 
             if wandb_logger and cfg.save_artifacts:
