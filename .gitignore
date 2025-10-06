@@ -10,3 +10,5 @@ validation_ijbs
 result
 scripts/run_debug*
 .DS_Store
+wandb
+work_dirs

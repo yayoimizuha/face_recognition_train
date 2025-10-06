@@ -13,7 +13,7 @@ For inquiries, please contact the author at anjith.george@idiap.ch
 """
 from .timmfr import get_timmfrv2, replace_linear_with_lowrank_2, replace_activation_function
 from .iresnet import iresnet18, iresnet34, iresnet50, iresnet100, iresnet200
-from .mobilefacenet import get_mbf
+from .mobilefacenet import get_mbf,get_mbf_large
 
 import torch
 
@@ -49,6 +49,19 @@ def get_model(name, **kwargs):
         return model
     elif name == 'edgeface_s_gamma_05':
         return replace_linear_with_lowrank_2(get_timmfrv2('edgenext_small', batchnorm=False), rank_ratio=0.5)
+
+    elif name == "mbf":
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_mbf(fp16=fp16, num_features=num_features)
+
+    elif name == "mbf_large":
+        from .mobilefacenet import get_mbf_large
+        fp16 = kwargs.get("fp16", False)
+        num_features = kwargs.get("num_features", 512)
+        return get_mbf_large(fp16=fp16, num_features=num_features)
+
+
     else:
         raise ValueError()
 

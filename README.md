@@ -37,6 +37,22 @@ After finishing this step, launch:
 torchrun --nproc_per_node=4 train_v2_restart.py configs/edgeface_xs_gamma_06_restart.py
 ```
 
+### Using WebDataset for training
+
+This repo now supports WebDataset shards for training. Set `config.rec` to one of:
+
+- A directory containing `.tar` shards (auto-expanded as `<dir>/*.tar`)
+- A single `.tar` file path
+- A brace/glob pattern like `/data/shards/{000000..000999}.tar` or `/data/shards/*.tar`
+- A text file listing shard URLs/paths (one per line), e.g. `shards.txt`
+
+Samples must include an image (`jpg/jpeg/png`) and an integer class label in the `cls` key.
+Example config snippet:
+
+```python
+config.rec = "/data/webdataset/shards/{000000..000127}.tar"
+```
+
 
 # EdgeFace Models via `torch.hub`
 
