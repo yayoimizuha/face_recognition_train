@@ -90,7 +90,8 @@ def main(args):
         cfg.dali,
         cfg.dali_aug,
         cfg.seed,
-        cfg.num_workers
+        cfg.num_workers,
+        getattr(cfg, "webdataset", False)
     )
 
     backbone = get_model(
@@ -175,7 +176,9 @@ def main(args):
     for epoch in range(start_epoch, cfg.num_epoch):
 
         if isinstance(train_loader, DataLoader):
-            train_loader.sampler.set_epoch(epoch)
+            sampler = getattr(train_loader, "sampler", None)
+            if sampler is not None and hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
         for _, (img, local_labels) in enumerate(train_loader):
             global_step += 1
             local_embeddings = backbone(img)

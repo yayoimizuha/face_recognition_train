@@ -16,11 +16,10 @@ config.lr = 0.1
 config.verbose = 2000
 config.dali = False
 # DataLoader 用
-config.num_workers = 5
+config.num_workers = 2
 # DALI 増強は無効（HF の DataLoader を使用）
 config.dali_aug = False
-# Use Hugging Face datasets: yayoimizuha/Glint360k with streaming enabled.
-# To disable streaming, use &streaming=false. For key changes, use &image_key=...&label_key=...
+config.webdataset = True
 config.rec = "/mnt/nvme/Glint360k_WebDataset/"
 
 # Glint360k のクラス数と画像枚数（スケジューラ計算用）

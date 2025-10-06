@@ -2,7 +2,7 @@ import numbers
 import os
 import queue as Queue
 import threading
-from typing import Iterable
+from typing import Iterable, Union, List
 
 # import mxnet as mx
 import numpy as np
@@ -10,6 +10,7 @@ import torch
 from functools import partial
 from torch import distributed
 from torch.utils.data import DataLoader, Dataset
+from glob import glob
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from utils.utils_distributed_sampler import DistributedSampler
@@ -17,13 +18,14 @@ from utils.utils_distributed_sampler import get_dist_info, worker_init_fn
 
 
 def get_dataloader(
-    root_dir,
-    local_rank,
-    batch_size,
-    dali = False,
-    dali_aug = False,
-    seed = 2048,
-    num_workers = 2,
+    root_dir: str,
+    local_rank: int,
+    batch_size: int,
+    dali: bool = False,
+    dali_aug: bool = False,
+    seed: int = 2048,
+    num_workers: int = 2,
+    webdataset: bool = False,
     ) -> Iterable:
 
     rec = os.path.join(root_dir, 'train.rec')
@@ -38,6 +40,10 @@ def get_dataloader(
     # Mxnet RecordIO
     # elif os.path.exists(rec) and os.path.exists(idx):
     #     train_set = MXFaceDataset(root_dir=root_dir, local_rank=local_rank)
+
+    # WebDataset shards
+    elif webdataset:
+        train_set = _build_webdataset(root_dir)
 
     # Image Folder
     else:
@@ -55,26 +61,141 @@ def get_dataloader(
             num_threads=2, local_rank=local_rank, dali_aug=dali_aug)
 
     rank, world_size = get_dist_info()
-    train_sampler = DistributedSampler(
-        train_set, num_replicas=world_size, rank=rank, shuffle=True, seed=seed)
-
-    if seed is None:
-        init_fn = None
+    # IterableDataset (WebDataset) cannot use a Sampler; use internal sharding and shuffling
+    if webdataset:
+        if seed is None:
+            init_fn = None
+        else:
+            init_fn = partial(worker_init_fn, num_workers=num_workers, rank=rank, seed=seed)
+        train_loader = DataLoaderX(
+            local_rank=local_rank,
+            dataset=train_set,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+            worker_init_fn=init_fn,
+        )
     else:
-        init_fn = partial(worker_init_fn, num_workers=num_workers, rank=rank, seed=seed)
+        train_sampler = DistributedSampler(
+            train_set, num_replicas=world_size, rank=rank, shuffle=True, seed=seed)
 
-    train_loader = DataLoaderX(
-        local_rank=local_rank,
-        dataset=train_set,
-        batch_size=batch_size,
-        sampler=train_sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
-        worker_init_fn=init_fn,
-    )
+        if seed is None:
+            init_fn = None
+        else:
+            init_fn = partial(worker_init_fn, num_workers=num_workers, rank=rank, seed=seed)
+
+        train_loader = DataLoaderX(
+            local_rank=local_rank,
+            dataset=train_set,
+            batch_size=batch_size,
+            sampler=train_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+            worker_init_fn=init_fn,
+        )
 
     return train_loader
+
+
+def _build_webdataset(src: str):
+    """Build a WebDataset pipeline from a directory, pattern, list file, or URL.
+
+    Expected sample keys: image ext in {jpg,jpeg,png} and integer label in 'cls'.
+    Performs simple augmentation: random horizontal flip and normalization to [-1, 1].
+    The dataset is sharded across ranks and workers automatically.
+    """
+    try:
+        import webdataset as wds
+    except Exception as e:
+        raise RuntimeError(
+            "webdataset package is required for WebDataset training. Please install it."
+        ) from e
+
+    # Resolve shards input: directory -> *.tar, file list -> read lines, else use as-is
+    shards: Union[str, List[str]]
+    if os.path.isdir(src):
+        shards = sorted(glob(os.path.join(src, "*.tar")))
+        if len(shards) == 0:
+            raise FileNotFoundError(f"No .tar shards found in directory: {src}")
+    elif os.path.isfile(src) and src.lower().endswith(".txt"):
+        with open(src, "r", encoding="utf-8") as f:
+            shards = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+        if len(shards) == 0:
+            raise FileNotFoundError(f"No shard entries found in list file: {src}")
+    else:
+        shards = src
+
+    # Transforms matching ImageFolder path
+    transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
+
+    def decode_label(lbl):
+        # Robustly convert various label representations to integer tensor
+        import numpy as _np
+        import json as _json
+        # If label is a JSON dict, extract 'cls'
+        if isinstance(lbl, dict) and "cls" in lbl:
+            return torch.tensor(int(lbl["cls"]), dtype=torch.long)
+        if isinstance(lbl, (bytes, bytearray)):
+            try:
+                lbl = int(lbl.decode("utf-8").strip())
+            except Exception:
+                # Try JSON then numpy buffer
+                try:
+                    obj = _json.loads(lbl.decode("utf-8"))
+                    if isinstance(obj, dict) and "cls" in obj:
+                        lbl = int(obj["cls"])
+                    else:
+                        lbl = int(obj)
+                except Exception:
+                    try:
+                        lbl = int(_np.frombuffer(lbl, dtype=_np.int64).flatten()[0])
+                    except Exception:
+                        raise ValueError("Unsupported label byte format in WebDataset sample")
+        elif isinstance(lbl, (int,)):
+            pass
+        elif hasattr(lbl, "item"):
+            # torch/np scalar
+            try:
+                lbl = int(lbl.item())
+            except Exception:
+                lbl = int(lbl)
+        elif isinstance(lbl, (list, tuple)) and len(lbl) > 0:
+            lbl = int(lbl[0])
+        else:
+            # last resort
+            lbl = int(lbl)
+        return torch.tensor(lbl, dtype=torch.long)
+
+    def preprocess(sample):
+        img, lbl = sample
+        # img is PIL.Image from decode('pil')
+        img = transform(img)
+        lbl = decode_label(lbl)
+        return img, lbl
+
+    dataset = (
+        wds.WebDataset(
+            shards,
+            shardshuffle=1000,  # positive int to avoid compat warning
+            nodesplitter=wds.split_by_node,
+            workersplitter=wds.split_by_worker,
+            handler=wds.warn_and_continue,
+            empty_check=False,  # allow some workers to have zero shards without raising
+        )
+        .shuffle(10000)
+    .decode("pil")
+        # Accept common image extensions; for label, try various common keys
+        .to_tuple("jpg;jpeg;png;webp", "cls;cls.txt;label;label.txt;json")
+        .map(preprocess)
+    )
+
+    return dataset
 
 class BackgroundGenerator(threading.Thread):
     def __init__(self, generator, local_rank, max_prefetch=6):
