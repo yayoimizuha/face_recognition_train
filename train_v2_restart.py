@@ -191,14 +191,15 @@ def main(args):
                     torch.nn.utils.clip_grad_norm_(backbone.parameters(), 5)
                     amp.step(opt)
                     amp.update()
+                    lr_scheduler.step()
                     opt.zero_grad()
             else:
                 loss.backward()
                 if global_step % cfg.gradient_acc == 0:
                     torch.nn.utils.clip_grad_norm_(backbone.parameters(), 5)
                     opt.step()
+                    lr_scheduler.step()
                     opt.zero_grad()
-            lr_scheduler.step()
 
             with torch.no_grad():
                 if wandb_logger:
