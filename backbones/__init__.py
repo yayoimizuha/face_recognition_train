@@ -30,7 +30,7 @@ def get_model(name, **kwargs):
     elif name == 'edgeface_xxs':
         return get_timmfrv2('edgenext_xx_small', batchnorm=False)
     elif name == 'convnext-large':
-        return get_timmfrv2('facebook/convnext-large-224-22k', batchnorm=False)
+        return get_timmfrv2('convnext_large.fb_in22k_ft_in1k', batchnorm=False)
     elif name == 'edgeface_base':
         return get_timmfrv2('edgenext_base', batchnorm=False)
     elif name == 'mobilenetv4_conv_medium':
