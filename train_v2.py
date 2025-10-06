@@ -160,8 +160,9 @@ def main(args):
         num_space = 25 - len(key)
         logging.info(": " + key + " " * num_space + str(value))
 
+    ver_prefix = getattr(cfg, "val_dir", None) or cfg.rec
     callback_verification = CallBackVerification(
-        val_targets=cfg.val_targets, rec_prefix=cfg.rec,
+        val_targets=cfg.val_targets, rec_prefix=ver_prefix,
         summary_writer=summary_writer, wandb_logger=wandb_logger
     )
     callback_logging = CallBackLogging(
@@ -173,7 +174,8 @@ def main(args):
     )
 
     loss_am = AverageMeter()
-    amp = torch.amp.GradScaler(device="cuda", growth_interval=100)
+    # Use CUDA GradScaler for broader compatibility and to match callback type hints
+    amp = torch.cuda.amp.GradScaler(growth_interval=100)
 
     for epoch in range(start_epoch, cfg.num_epoch):
 
@@ -240,7 +242,9 @@ def main(args):
                 wandb_logger.log_artifact(model)
 
         if cfg.dali:
-            train_loader.reset()
+            reset_fn = getattr(train_loader, "reset", None)
+            if callable(reset_fn):
+                reset_fn()
 
     if rank == 0:
         path_module = os.path.join(cfg.output, "model.pt")
