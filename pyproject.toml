@@ -26,7 +26,8 @@ dependencies = [
     "wandb~=0.22",
     "python-dotenv~=1.1",
     "webdataset~=1.0",
-    "datasets~=4.1"
+    "datasets~=4.1",
+    "transformers~=4"
 ]
 
 [[tool.uv.index]]
