@@ -58,11 +58,12 @@ def get_model(name, **kwargs):
         return get_mbf(fp16=fp16, num_features=num_features)
 
     elif name == "mbf_large":
-        from .mobilefacenet import get_mbf_large
         fp16 = kwargs.get("fp16", False)
         num_features = kwargs.get("num_features", 512)
         return get_mbf_large(fp16=fp16, num_features=num_features)
-
+    
+    elif name.startswith('hf-hub:'):
+        return get_timmfrv2(name, batchnorm=False)
 
     else:
         raise ValueError()
