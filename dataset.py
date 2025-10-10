@@ -4,7 +4,6 @@ import queue as Queue
 import threading
 from typing import Iterable, Union, List, Any, cast
 
-# import mxnet as mx
 import numpy as np
 import torch
 from functools import partial
@@ -26,10 +25,9 @@ def get_dataloader(
     seed: int = 2048,
     num_workers: int = 2,
     dataset_type: str = "imagefolder",
+    device_type: str | None = None,
     ) -> Iterable:
 
-    rec = os.path.join(root_dir, 'train.rec')
-    idx = os.path.join(root_dir, 'train.idx')
     train_set = None
     ds_type = (dataset_type or "imagefolder").lower()
 
@@ -38,9 +36,7 @@ def get_dataloader(
         train_set = SyntheticDataset()
         dali = False
 
-    # Mxnet RecordIO
-    # elif os.path.exists(rec) and os.path.exists(idx):
-    #     train_set = MXFaceDataset(root_dir=root_dir, local_rank=local_rank)
+    # MXNet RecordIO support has been removed
 
     # WebDataset shards
     elif ds_type == "webdataset" and not dali:
@@ -56,7 +52,7 @@ def get_dataloader(
              ])
         train_set = ImageFolder(root_dir, transform)
     elif not dali and ds_type == "tfrecord":
-        raise NotImplementedError("Non-DALI TFRecord pipeline is not supported; set dali=True or use imagefolder/webdataset.")
+        raise ValueError("dataset_type='tfrecord' is no longer supported. Use 'imagefolder' or 'webdataset'.")
     else:
         # Fallback for unknown types when not using DALI
         transform = transforms.Compose([
@@ -72,11 +68,10 @@ def get_dataloader(
             batch_size=batch_size,
             src=root_dir,
             dataset_type=ds_type,
-            rec_file=rec,
-            idx_file=idx,
             num_threads=2,
             local_rank=local_rank,
-            dali_aug=dali_aug))
+            dali_aug=dali_aug,
+            device_type=device_type))
 
     rank, world_size = get_dist_info()
     # IterableDataset (WebDataset) cannot use a Sampler; use internal sharding and shuffling
@@ -87,10 +82,11 @@ def get_dataloader(
             init_fn = partial(worker_init_fn, num_workers=num_workers, rank=rank, seed=seed)
         train_loader = DataLoaderX(
             local_rank=local_rank,
+            device_type=device_type,
             dataset=train_set,
             batch_size=batch_size,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available() and (device_type in (None, "cuda")),
             drop_last=True,
             worker_init_fn=init_fn,
         )
@@ -105,11 +101,12 @@ def get_dataloader(
 
         train_loader = DataLoaderX(
             local_rank=local_rank,
+            device_type=device_type,
             dataset=train_set,
             batch_size=batch_size,
             sampler=train_sampler,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=(torch.cuda.is_available() and (device_type in (None, "cuda"))),
             drop_last=True,
             worker_init_fn=init_fn,
         )
@@ -218,16 +215,21 @@ def _build_webdataset(src: str):
     return dataset
 
 class BackgroundGenerator(threading.Thread):
-    def __init__(self, generator, local_rank, max_prefetch=6):
+    def __init__(self, generator, local_rank, device_type: str | None, max_prefetch=6):
         super(BackgroundGenerator, self).__init__()
         self.queue = Queue.Queue(max_prefetch)
         self.generator = generator
         self.local_rank = local_rank
+        self.device_type = (device_type or ("cuda" if torch.cuda.is_available() else ("xpu" if torch.xpu.is_available() else "cpu")))
         self.daemon = True
         self.start()
 
     def run(self):
-        torch.cuda.set_device(self.local_rank)
+        # Set device context only for accelerator backends
+        if self.device_type == "cuda" and torch.cuda.is_available():
+            torch.cuda.set_device(self.local_rank)
+        elif self.device_type == "xpu" and torch.xpu.is_available():
+            torch.xpu.set_device(self.local_rank)
         for item in self.generator:
             self.queue.put(item)
         self.queue.put(None)
@@ -247,14 +249,16 @@ class BackgroundGenerator(threading.Thread):
 
 class DataLoaderX(DataLoader):
 
-    def __init__(self, local_rank, **kwargs):
+    def __init__(self, local_rank, device_type: str | None = None, **kwargs):
         super(DataLoaderX, self).__init__(**kwargs)
-        self.stream = torch.cuda.Stream(local_rank)
         self.local_rank = local_rank
+        self.device_type = (device_type or ("cuda" if torch.cuda.is_available() else ("xpu" if torch.xpu.is_available() else "cpu")))
+        # Use CUDA stream only on CUDA; for other backends, disable custom stream prefetch to avoid backend-specific APIs
+        self.stream = torch.cuda.Stream(local_rank) if (self.device_type == "cuda" and torch.cuda.is_available()) else None
 
     def __iter__(self):
         self.iter = super(DataLoaderX, self).__iter__()
-        self.iter = BackgroundGenerator(self.iter, self.local_rank)
+        self.iter = BackgroundGenerator(self.iter, self.local_rank, self.device_type)
         self.preload()
         return self
 
@@ -262,12 +266,19 @@ class DataLoaderX(DataLoader):
         self.batch = next(self.iter, None)
         if self.batch is None:
             return None
-        with torch.cuda.stream(self.stream):
-            for k in range(len(self.batch)):
-                self.batch[k] = self.batch[k].to(device=self.local_rank, non_blocking=True)
+        if self.stream is not None and self.device_type == "cuda":
+            with torch.cuda.stream(self.stream):
+                # Move batch tensors to the target CUDA device asynchronously
+                device = torch.device("cuda", self.local_rank)
+                for k in range(len(self.batch)):
+                    self.batch[k] = self.batch[k].to(device=device, non_blocking=True)
+        else:
+            # For non-CUDA backends, keep data on CPU; the main training loop will move tensors appropriately.
+            pass
 
     def __next__(self):
-        torch.cuda.current_stream().wait_stream(self.stream)
+        if self.stream is not None and self.device_type == "cuda":
+            torch.cuda.current_stream().wait_stream(self.stream)
         batch = self.batch
         if batch is None:
             raise StopIteration
@@ -335,8 +346,6 @@ def dali_data_iter(
     batch_size: int,
     src: str,
     dataset_type: str,
-    rec_file: str,
-    idx_file: str,
     num_threads: int,
     initial_fill=32768,
     random_shuffle=True,
@@ -345,7 +354,8 @@ def dali_data_iter(
     name="reader",
     mean=(127.5, 127.5, 127.5), 
     std=(127.5, 127.5, 127.5),
-    dali_aug=False
+    dali_aug=False,
+    device_type: str | None = None
     ):
     """
     Parameters:
@@ -354,6 +364,10 @@ def dali_data_iter(
         Size of the buffer that is used for shuffling. If random_shuffle is False, this parameter is ignored.
 
     """
+    # DALI is supported only with CUDA devices. Guard early.
+    if not torch.cuda.is_available():
+        raise RuntimeError("DALI pipeline requires CUDA-enabled PyTorch. Set config.dali=False for CPU/XPU training.")
+
     rank: int = distributed.get_rank()
     world_size: int = distributed.get_world_size()
     import nvidia.dali.fn as fn
@@ -433,52 +447,10 @@ def dali_data_iter(
             jpegs = wds_out[0]  # type: ignore[index]
             labels = wds_out[1]  # type: ignore[index]
             images = fn.decoders.image(jpegs, device="mixed")
-        elif reader_type == "tfrecord":
-            # Basic TFRecord support requires matching index files and default feature keys
-            try:
-                import nvidia.dali.tfrecord as tfrec  # type: ignore
-                tfrec = _cast(_Any, tfrec)
-            except Exception as e:
-                raise RuntimeError("DALI TFRecord support requires nvidia.dali.tfrecord module") from e
-            # Infer paths and index_paths
-            if os.path.isdir(src):
-                tf_paths = sorted(glob(os.path.join(src, "*.tfrecord")))
-                idx_paths = [p + ".idx" if os.path.exists(p + ".idx") else p.replace(".tfrecord", ".idx") for p in tf_paths]
-            elif os.path.isfile(src) and src.lower().endswith(".txt"):
-                with open(src, "r", encoding="utf-8") as _f:
-                    tf_paths = [ln.strip() for ln in _f if ln.strip() and not ln.strip().startswith('#')]
-                idx_paths = [p + ".idx" if os.path.exists(p + ".idx") else p.replace(".tfrecord", ".idx") for p in tf_paths]
-            else:
-                tf_paths = [src]
-                idx_paths = [src + ".idx" if os.path.exists(src + ".idx") else src.replace(".tfrecord", ".idx")]
-            if not (len(tf_paths) == len(idx_paths) and len(tf_paths) > 0):
-                raise FileNotFoundError("TFRecord paths and index paths could not be resolved")
-            features = {
-                "image/encoded": tfrec.FixedLenFeature([], tfrec.string, ""),
-                "image/class/label": tfrec.FixedLenFeature([1], tfrec.int64, 0),
-            }
-            feature_names = list(features.keys())
-            outputs = fn.readers.tfrecord(
-                path=tf_paths,
-                index_path=idx_paths,
-                features=features,
-                random_shuffle=random_shuffle,
-                pad_last_batch=False,
-                name=name,
-                shard_id=rank,
-                num_shards=world_size,
-            )
-            # outputs are returned in the same order as features
-            jpegs = outputs[feature_names.index("image/encoded")]  # type: ignore[index]
-            labels = outputs[feature_names.index("image/class/label")]  # type: ignore[index]
-            images = fn.decoders.image(jpegs, device="mixed")
         else:
-            # Fallback to old MXNet RecordIO if available
-            jpegs, labels = fn.readers.mxnet(
-                path=rec_file, index_path=idx_file, initial_fill=initial_fill, 
-                num_shards=world_size, shard_id=rank,
-                random_shuffle=random_shuffle, pad_last_batch=False, name=name)
-            images = fn.decoders.image(jpegs, device="mixed")
+            raise ValueError(
+                f"Unsupported dataset_type='{reader_type}' for DALI. Use 'imagefolder' or 'webdataset'."
+            )
         if dali_aug:
             images = fn.cast(images, dtype=types.UINT8)  # type: ignore[attr-defined]
             images = multiplexing(condition_resize, dali_random_resize(images, size_resize, image_size=112), images)
@@ -490,18 +462,25 @@ def dali_data_iter(
             images, dtype=types.FLOAT, mean=mean, std=std, mirror=condition_flip)  # type: ignore[attr-defined]
         pipe.set_outputs(images, labels)
     pipe.build()
-    return DALIWarper(DALIClassificationIterator(pipelines=[pipe], reader_name=name, ))
+    return DALIWarper(DALIClassificationIterator(pipelines=[pipe], reader_name=name, ), device_type=device_type)
 
 
 class DALIWarper(object):
     @torch.no_grad()
-    def __init__(self, dali_iter):
+    def __init__(self, dali_iter, device_type: str | None = None):
         self.iter = dali_iter
+        self.device_type = (device_type or ("cuda" if torch.cuda.is_available() else ("xpu" if torch.xpu.is_available() else "cpu")))
 
     def __next__(self):
         data_dict = self.iter.__next__()[0]
-        tensor_data = data_dict['data'].cuda()
-        tensor_label: torch.Tensor = data_dict['label'].cuda().long()
+        if self.device_type == "cuda" and torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif self.device_type == "xpu" and torch.xpu.is_available():
+            device = torch.device("xpu")
+        else:
+            device = torch.device("cpu")
+        tensor_data = data_dict['data'].to(device)
+        tensor_label: torch.Tensor = data_dict['label'].to(device).long()
         tensor_label.squeeze_()
         return tensor_data, tensor_label
 

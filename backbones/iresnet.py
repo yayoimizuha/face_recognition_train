@@ -146,7 +146,8 @@ class IResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        with torch.amp.autocast(device_type="cuda",enabled=self.fp16):
+        # Use autocast on the input tensor's device type (cuda/xpu/cpu)
+        with torch.autocast(device_type=x.device.type, enabled=self.fp16 and x.device.type != "cpu"):
             x = self.conv1(x)
             x = self.bn1(x)
             x = self.prelu(x)

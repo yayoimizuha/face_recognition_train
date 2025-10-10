@@ -85,7 +85,7 @@ class CallBackLogging(object):
                  epoch: int,
                  fp16: bool,
                  learning_rate: float,
-                 grad_scaler: torch.cuda.amp.GradScaler):
+                 grad_scaler: torch.amp.grad_scaler.GradScaler):
         if self.rank == 0 and global_step > 0 and global_step % self.frequent == 0:
             if self.init:
                 try:

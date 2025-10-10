@@ -18,27 +18,21 @@ from utils.utils_config import get_config
 from utils.utils_distributed_sampler import setup_seed
 from utils.utils_logging import AverageMeter, init_logging
 from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compress_hook
+from torch.amp.grad_scaler import GradScaler
 import os
 import sys
 
 assert torch.__version__ >= "1.12.0", "In order to enjoy the features of the new torch, \
 we have upgraded the torch to 1.12.0. torch before than 1.12.0 may not work in the future."
 
-try:
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    distributed.init_process_group("nccl")
-except KeyError:
-    rank = 0
-    local_rank = 0
-    world_size = 1
-    distributed.init_process_group(
-        backend="nccl",
-        init_method="tcp://127.0.0.1:12584",
-        rank=rank,
-        world_size=world_size,
-    )
+# detect device type and choose dist backend accordingly
+def _detect_device_type() -> str:
+    # Prefer Intel XPU if available
+    if torch.xpu.is_available():
+        return "xpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 
 def main(args):
@@ -47,7 +41,51 @@ def main(args):
     # global control random seed
     setup_seed(seed=cfg.seed, cuda_deterministic=False)
 
-    torch.cuda.set_device(local_rank)
+    # decide device from config or auto-detect
+    cfg_device = getattr(cfg, "device_type", None)
+    requested_device = (cfg_device or "").lower() if isinstance(cfg_device, str) else None
+    detected_device = _detect_device_type()
+    device_type = requested_device or detected_device
+    # validate availability; if requested but unavailable, fall back
+    if requested_device == "cuda" and not torch.cuda.is_available():
+        logging.warning("Requested device 'cuda' is unavailable. Falling back to detected '%s'", detected_device)
+        device_type = detected_device
+    if requested_device == "xpu" and not torch.xpu.is_available():
+        logging.warning("Requested device 'xpu' is unavailable. Falling back to detected '%s'", detected_device)
+        device_type = detected_device
+
+    # Select backend by device
+    if device_type == "xpu":
+        dist_backend = "ccl"  # oneCCL for Intel XPU
+    elif device_type == "cuda":
+        dist_backend = "nccl"  # CUDA/ROCm
+    else:
+        dist_backend = "gloo"  # CPU fallback
+
+    # init process group
+    try:
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        distributed.init_process_group(dist_backend)
+    except KeyError:
+        rank = 0
+        local_rank = 0
+        world_size = 1
+        distributed.init_process_group(
+            backend=dist_backend,
+            init_method="tcp://127.0.0.1:12584",
+            rank=rank,
+            world_size=world_size,
+        )
+
+    # set device
+    if device_type == "cuda":
+        torch.cuda.set_device(local_rank)
+    elif device_type == "xpu":
+        torch.xpu.set_device(local_rank)
+
+    device = torch.device(device_type)
 
     os.makedirs(cfg.output, exist_ok=True)
     init_logging(rank, cfg.output)
@@ -83,24 +121,30 @@ def main(args):
         except Exception as e:
             print("WandB Data (Entity and Project name) must be provided in config file (base.py).")
             print(f"Config Error: {e}")
+    # DALI は CUDA 前提のため、非 CUDA 環境では自動で無効化
+    dali_enabled = bool(getattr(cfg, "dali", False) and device.type == "cuda")
     train_loader = get_dataloader(
         cfg.rec,
         local_rank,
         cfg.batch_size,
-        cfg.dali,
+        dali_enabled,
         cfg.dali_aug,
         cfg.seed,
         cfg.num_workers,
         getattr(cfg, "dataset_type", "imagefolder"),
+        device_type=device_type,
     )
 
     backbone = get_model(
-        cfg.network, dropout=0.0, fp16=cfg.fp16, num_features=cfg.embedding_size).cuda()
+        cfg.network, dropout=0.0, fp16=cfg.fp16, num_features=cfg.embedding_size).to(device)
 
+    ddp_device_ids = [local_rank] if device.type != "cpu" else None
     backbone = torch.nn.parallel.DistributedDataParallel(
-        module=backbone, broadcast_buffers=False, device_ids=[local_rank], bucket_cap_mb=16,
+        module=backbone, broadcast_buffers=False, device_ids=ddp_device_ids, bucket_cap_mb=16,
         find_unused_parameters=True)
-    backbone.register_comm_hook(None, fp16_compress_hook)
+    # NCCL 環境のみ fp16 圧縮フックを使用（他 backend では未対応/非推奨）
+    if dist_backend == "nccl":
+        backbone.register_comm_hook(None, fp16_compress_hook)
 
     backbone.train()
     # FIXME using gradient checkpoint if there are some unused parameters will cause error
@@ -118,7 +162,7 @@ def main(args):
         module_partial_fc = PartialFC_V2(
             margin_loss, cfg.embedding_size, cfg.num_classes,
             cfg.sample_rate, False)
-        module_partial_fc.train().cuda()
+        module_partial_fc.train().to(device)
         # TODO the params of partial fc must be last in the params list
         opt = torch.optim.SGD(
             params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}],
@@ -128,7 +172,7 @@ def main(args):
         module_partial_fc = PartialFC_V2(
             margin_loss, cfg.embedding_size, cfg.num_classes,
             cfg.sample_rate, False)
-        module_partial_fc.train().cuda()
+        module_partial_fc.train().to(device)
         opt = torch.optim.AdamW(
             params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}],
             lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -174,8 +218,7 @@ def main(args):
     )
 
     loss_am = AverageMeter()
-    # Use CUDA GradScaler for broader compatibility and to match callback type hints
-    amp = torch.cuda.amp.GradScaler(growth_interval=100)
+    amp = GradScaler(device=device_type,enabled=(cfg.fp16 and device.type != "cpu"), growth_interval=100)
 
     for epoch in range(start_epoch, cfg.num_epoch):
 
@@ -185,10 +228,19 @@ def main(args):
                 sampler.set_epoch(epoch)
         for _, (img, local_labels) in enumerate(train_loader):
             global_step += 1
+            # Ensure tensors are on the right device
+            try:
+                img = img.to(device, non_blocking=True)
+            except Exception:
+                img = img.to(device)
+            try:
+                local_labels = local_labels.to(device, non_blocking=True)
+            except Exception:
+                local_labels = local_labels.to(device)
             local_embeddings = backbone(img)
             loss: torch.Tensor = module_partial_fc(local_embeddings, local_labels)
 
-            if cfg.fp16:
+            if amp.is_enabled():
                 amp.scale(loss).backward()
                 if global_step % cfg.gradient_acc == 0:
                     amp.unscale_(opt)
@@ -214,7 +266,7 @@ def main(args):
                     })
 
                 loss_am.update(loss.item(), 1)
-                callback_logging(global_step, loss_am, epoch, cfg.fp16, lr_scheduler.get_last_lr()[0], amp)
+                callback_logging(global_step, loss_am, epoch, amp.is_enabled(), lr_scheduler.get_last_lr()[0], amp)
 
                 if global_step % cfg.verbose == 0 and global_step > 0:
                     callback_verification(global_step, backbone)
@@ -240,7 +292,7 @@ def main(args):
                 model.add_file(path_module)
                 wandb_logger.log_artifact(model)
 
-        if cfg.dali:
+        if dali_enabled:
             reset_fn = getattr(train_loader, "reset", None)
             if callable(reset_fn):
                 reset_fn()
@@ -257,7 +309,9 @@ def main(args):
 
 
 if __name__ == "__main__":
-    torch.backends.cudnn.benchmark = True
+    # Enable cudnn benchmark only when available (CUDA)
+    if hasattr(torch.backends, "cudnn") and torch.backends.cudnn.is_available():
+        torch.backends.cudnn.benchmark = True
     parser = argparse.ArgumentParser(
         description="Distributed Arcface Training in Pytorch")
     parser.add_argument("config", type=str, help="py config file")

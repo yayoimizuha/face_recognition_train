@@ -20,6 +20,9 @@ config.output = "ms1mv3_arcface_r50"
 
 config.embedding_size = 512
 
+# Device selection: "cuda" | "xpu" | "cpu"
+config.device_type = "cuda"
+
 # Partial FC
 config.sample_rate = 1
 config.interclass_filtering_threshold = 0
@@ -44,7 +47,7 @@ config.frequent = 10
 # For Large Sacle Dataset, such as WebFace42M
 config.dali = False
 config.dali_aug = False
-config.dataset_type = "imagefolder"  # choose from: "imagefolder", "webdataset", "tfrecord"
+config.dataset_type = "imagefolder"  # choose from: "imagefolder", "webdataset"
 
 # Gradient ACC
 config.gradient_acc = 1

@@ -88,12 +88,13 @@ class PartialFC_V2(torch.nn.Module):
                 pass
         """
         with torch.no_grad():
-            positive = torch.unique(labels[index_positive], sorted=True).cuda()
+            device = labels.device
+            positive = torch.unique(labels[index_positive], sorted=True).to(device)
             if self.num_sample - positive.size(0) >= 0:
-                perm = torch.rand(size=[self.num_local]).cuda()
+                perm = torch.rand(size=[self.num_local], device=device)
                 perm[positive] = 2.0
-                index = torch.topk(perm, k=self.num_sample)[1].cuda()
-                index = index.sort()[0].cuda()
+                index = torch.topk(perm, k=self.num_sample)[1].to(device)
+                index = index.sort()[0].to(device)
             else:
                 index = positive
             self.weight_index = index
@@ -128,12 +129,14 @@ class PartialFC_V2(torch.nn.Module):
         assert self.last_batch_size == batch_size, (
             f"last batch size do not equal current batch size: {self.last_batch_size} vs {batch_size}")
 
+        emb_device = local_embeddings.device
+        lbl_device = local_labels.device
         _gather_embeddings = [
-            torch.zeros((batch_size, self.embedding_size)).cuda()
+            torch.zeros((batch_size, self.embedding_size), device=emb_device)
             for _ in range(self.world_size)
         ]
         _gather_labels = [
-            torch.zeros(batch_size).long().cuda() for _ in range(self.world_size)
+            torch.zeros(batch_size, dtype=torch.long, device=lbl_device) for _ in range(self.world_size)
         ]
         _list_embeddings = AllGather(local_embeddings, *_gather_embeddings)
         distributed.all_gather(_gather_labels, local_labels)
@@ -153,7 +156,8 @@ class PartialFC_V2(torch.nn.Module):
         else:
             weight = self.weight
 
-        with torch.amp.autocast(device_type="cuda", enabled=self.fp16):
+        # Use device-appropriate autocast when enabled
+        with torch.autocast(device_type=embeddings.device.type, enabled=self.fp16):
             norm_embeddings = normalize(embeddings)
             norm_weight_activated = normalize(weight)
             logits = linear(norm_embeddings, norm_weight_activated)
@@ -241,16 +245,11 @@ class AllGatherFunc(torch.autograd.Function):
         rank = distributed.get_rank()
         grad_out = grad_list[rank]
 
-        dist_ops = [
-            distributed.reduce(grad_out, rank, distributed.ReduceOp.SUM, async_op=True)
-            if i == rank
-            else distributed.reduce(
-                grad_list[i], i, distributed.ReduceOp.SUM, async_op=True
-            )
-            for i in range(distributed.get_world_size())
-        ]
-        for _op in dist_ops:
-            _op.wait()
+        for i in range(distributed.get_world_size()):
+            if i == rank:
+                distributed.reduce(grad_out, rank, distributed.ReduceOp.SUM)
+            else:
+                distributed.reduce(grad_list[i], i, distributed.ReduceOp.SUM)
 
         grad_out *= len(grad_list)  # cooperate with distributed loss function
         return (grad_out, *[None for _ in range(len(grad_list))])

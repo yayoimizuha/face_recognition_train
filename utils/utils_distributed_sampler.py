@@ -5,21 +5,25 @@ import random
 import numpy as np
 import torch
 import torch.distributed as dist
+from typing import cast
+from collections.abc import Sized
 from torch.utils.data import DistributedSampler as _DistributedSampler
 
 
 def setup_seed(seed, cuda_deterministic=True):
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
-    if cuda_deterministic:  # slower, more reproducible
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    else:  # faster, less reproducible
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = True
+    if hasattr(torch.backends, "cudnn") and torch.backends.cudnn.is_available():
+        if cuda_deterministic:  # slower, more reproducible
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        else:  # faster, less reproducible
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
 
 
 def worker_init_fn(worker_id, num_workers, rank, seed):
@@ -42,7 +46,7 @@ def get_dist_info():
     return rank, world_size
 
 
-def sync_random_seed(seed=None, device="cuda"):
+def sync_random_seed(seed=None, device="auto"):
     """Make sure different ranks share the same seed.
     All workers must call this function, otherwise it will deadlock.
     This method is generally used in `DistributedSampler`,
@@ -55,8 +59,8 @@ def sync_random_seed(seed=None, device="cuda"):
     to select non-overlapped data from the same data list.
     Args:
         seed (int, Optional): The seed. Default to None.
-        device (str): The device where the seed will be put on.
-            Default to 'cuda'.
+        device (str): The device where the seed will be put on. One of 'cuda'|'xpu'|'cpu'|'auto'.
+            Default to 'auto' which selects 'cuda' if available, else 'xpu' if available, else 'cpu'.
     Returns:
         int: Seed to be used.
     """
@@ -69,10 +73,25 @@ def sync_random_seed(seed=None, device="cuda"):
     if world_size == 1:
         return seed
 
-    if rank == 0:
-        random_num = torch.tensor(seed, dtype=torch.int32, device=device)
+    if device == "auto":
+        if torch.cuda.is_available():
+            use_device = "cuda"
+        elif torch.xpu.is_available():
+            use_device = "xpu"
+        else:
+            use_device = "cpu"
     else:
-        random_num = torch.tensor(0, dtype=torch.int32, device=device)
+        # validate requested device
+        if device == "cuda" and not torch.cuda.is_available():
+            use_device = "cpu"
+        elif device == "xpu" and not torch.xpu.is_available():
+            use_device = "cpu"
+        else:
+            use_device = device
+    if rank == 0:
+        random_num = torch.tensor(seed, dtype=torch.int32, device=use_device)
+    else:
+        random_num = torch.tensor(0, dtype=torch.int32, device=use_device)
 
     dist.broadcast(random_num, src=0)
 
@@ -107,10 +126,12 @@ class DistributedSampler(_DistributedSampler):
             # use a different random ordering for each epoch.
             # Otherwise, the next iteration of this sampler will
             # yield the same ordering.
-            g.manual_seed(self.epoch + self.seed)
-            indices = torch.randperm(len(self.dataset), generator=g).tolist()
+            g.manual_seed(int(self.epoch + self.seed))
+            ds = cast(Sized, self.dataset)
+            indices = torch.randperm(len(ds), generator=g).tolist()
         else:
-            indices = torch.arange(len(self.dataset)).tolist()
+            ds = cast(Sized, self.dataset)
+            indices = torch.arange(len(ds)).tolist()
 
         # add extra samples to make it evenly divisible
         # in case that indices is shorter than half of total_size

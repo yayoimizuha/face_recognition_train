@@ -132,7 +132,8 @@ class MobileFaceNet(Module):
                     m.bias.data.zero_()
 
     def forward(self, x):
-        with torch.amp.autocast(device_type="cuda", enabled=self.fp16):
+        # Autocast on the actual input device; disable on CPU
+        with torch.autocast(device_type=x.device.type, enabled=self.fp16 and x.device.type != "cpu"):
             for func in self.layers:
                 x = func(x)
         x = self.conv_sep(x.float() if self.fp16 else x)
