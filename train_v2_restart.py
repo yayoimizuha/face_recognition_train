@@ -91,7 +91,7 @@ def main(args):
         cfg.dali_aug,
         cfg.seed,
         cfg.num_workers,
-        getattr(cfg, "webdataset", False)
+        getattr(cfg, "dataset_type", "imagefolder"),
     )
 
     backbone = get_model(

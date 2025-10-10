@@ -44,6 +44,7 @@ config.frequent = 10
 # For Large Sacle Dataset, such as WebFace42M
 config.dali = False
 config.dali_aug = False
+config.dataset_type = "imagefolder"  # choose from: "imagefolder", "webdataset", "tfrecord"
 
 # Gradient ACC
 config.gradient_acc = 1

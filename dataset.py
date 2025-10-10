@@ -2,7 +2,7 @@ import numbers
 import os
 import queue as Queue
 import threading
-from typing import Iterable, Union, List
+from typing import Iterable, Union, List, Any, cast
 
 # import mxnet as mx
 import numpy as np
@@ -25,12 +25,13 @@ def get_dataloader(
     dali_aug: bool = False,
     seed: int = 2048,
     num_workers: int = 2,
-    webdataset: bool = False,
+    dataset_type: str = "imagefolder",
     ) -> Iterable:
 
     rec = os.path.join(root_dir, 'train.rec')
     idx = os.path.join(root_dir, 'train.idx')
     train_set = None
+    ds_type = (dataset_type or "imagefolder").lower()
 
     # Synthetic
     if root_dir == "synthetic":
@@ -42,11 +43,22 @@ def get_dataloader(
     #     train_set = MXFaceDataset(root_dir=root_dir, local_rank=local_rank)
 
     # WebDataset shards
-    elif webdataset:
+    elif ds_type == "webdataset" and not dali:
+        # Python WebDataset pipeline (non-DALI)
         train_set = _build_webdataset(root_dir)
 
     # Image Folder
+    elif ds_type == "imagefolder" and not dali:
+        transform = transforms.Compose([
+             transforms.RandomHorizontalFlip(),
+             transforms.ToTensor(),
+             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+             ])
+        train_set = ImageFolder(root_dir, transform)
+    elif not dali and ds_type == "tfrecord":
+        raise NotImplementedError("Non-DALI TFRecord pipeline is not supported; set dali=True or use imagefolder/webdataset.")
     else:
+        # Fallback for unknown types when not using DALI
         transform = transforms.Compose([
              transforms.RandomHorizontalFlip(),
              transforms.ToTensor(),
@@ -56,13 +68,19 @@ def get_dataloader(
 
     # DALI
     if dali:
-        return dali_data_iter(
-            batch_size=batch_size, rec_file=rec, idx_file=idx,
-            num_threads=2, local_rank=local_rank, dali_aug=dali_aug)
+        return cast(Iterable, dali_data_iter(
+            batch_size=batch_size,
+            src=root_dir,
+            dataset_type=ds_type,
+            rec_file=rec,
+            idx_file=idx,
+            num_threads=2,
+            local_rank=local_rank,
+            dali_aug=dali_aug))
 
     rank, world_size = get_dist_info()
     # IterableDataset (WebDataset) cannot use a Sampler; use internal sharding and shuffling
-    if webdataset:
+    if ds_type == "webdataset" and not dali:
         if seed is None:
             init_fn = None
         else:
@@ -107,7 +125,9 @@ def _build_webdataset(src: str):
     The dataset is sharded across ranks and workers automatically.
     """
     try:
-        import webdataset as wds
+        import webdataset as wds  # type: ignore
+        from typing import Any, cast as _cast
+        wds = _cast(Any, wds)
     except Exception as e:
         raise RuntimeError(
             "webdataset package is required for WebDataset training. Please install it."
@@ -134,7 +154,7 @@ def _build_webdataset(src: str):
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
 
-    def decode_label(lbl):
+    def decode_label(lbl: Any) -> torch.Tensor:
         # Robustly convert various label representations to integer tensor
         import numpy as _np
         import json as _json
@@ -149,9 +169,9 @@ def _build_webdataset(src: str):
                 try:
                     obj = _json.loads(lbl.decode("utf-8"))
                     if isinstance(obj, dict) and "cls" in obj:
-                        lbl = int(obj["cls"])
+                        lbl = int(obj["cls"])  # type: ignore[arg-type]
                     else:
-                        lbl = int(obj)
+                        lbl = int(obj)  # type: ignore[arg-type]
                 except Exception:
                     try:
                         lbl = int(_np.frombuffer(lbl, dtype=_np.int64).flatten()[0])
@@ -162,14 +182,14 @@ def _build_webdataset(src: str):
         elif hasattr(lbl, "item"):
             # torch/np scalar
             try:
-                lbl = int(lbl.item())
+                lbl = int(lbl.item())  # type: ignore[arg-type]
             except Exception:
-                lbl = int(lbl)
+                lbl = int(lbl)  # type: ignore[arg-type]
         elif isinstance(lbl, (list, tuple)) and len(lbl) > 0:
-            lbl = int(lbl[0])
+            lbl = int(lbl[0])  # type: ignore[arg-type]
         else:
             # last resort
-            lbl = int(lbl)
+            lbl = int(lbl)  # type: ignore[arg-type]
         return torch.tensor(lbl, dtype=torch.long)
 
     def preprocess(sample):
@@ -183,13 +203,13 @@ def _build_webdataset(src: str):
         wds.WebDataset(
             shards,
             shardshuffle=1000,  # positive int to avoid compat warning
-            nodesplitter=wds.split_by_node,
-            workersplitter=wds.split_by_worker,
-            handler=wds.warn_and_continue,
+            nodesplitter=getattr(wds, 'split_by_node', None),
+            workersplitter=getattr(wds, 'split_by_worker', None),
+            handler=getattr(wds, 'warn_and_continue', None),
             empty_check=False,  # allow some workers to have zero shards without raising
         )
         .shuffle(10000)
-    .decode("pil")
+        .decode("pil")
         # Accept common image extensions; for label, try various common keys
         .to_tuple("jpg;jpeg;png;webp", "cls;cls.txt;label;label.txt;json")
         .map(preprocess)
@@ -312,9 +332,17 @@ class SyntheticDataset(Dataset):
 
 
 def dali_data_iter(
-    batch_size: int, rec_file: str, idx_file: str, num_threads: int,
-    initial_fill=32768, random_shuffle=True,
-    prefetch_queue_depth=1, local_rank=0, name="reader",
+    batch_size: int,
+    src: str,
+    dataset_type: str,
+    rec_file: str,
+    idx_file: str,
+    num_threads: int,
+    initial_fill=32768,
+    random_shuffle=True,
+    prefetch_queue_depth=1,
+    local_rank=0,
+    name="reader",
     mean=(127.5, 127.5, 127.5), 
     std=(127.5, 127.5, 127.5),
     dali_aug=False
@@ -329,20 +357,22 @@ def dali_data_iter(
     rank: int = distributed.get_rank()
     world_size: int = distributed.get_world_size()
     import nvidia.dali.fn as fn
-    import nvidia.dali.types as types
+    import nvidia.dali.types as types  # type: ignore
     from nvidia.dali.pipeline import Pipeline
     from nvidia.dali.plugin.pytorch import DALIClassificationIterator
+    from typing import Any as _Any, cast as _cast
+    types = _cast(_Any, types)
 
     def dali_random_resize(img, resize_size, image_size=112):
-        img = fn.resize(img, resize_x=resize_size, resize_y=resize_size)
-        img = fn.resize(img, size=(image_size, image_size))
+        img = fn.resize(img, resize_x=resize_size, resize_y=resize_size)  # type: ignore[arg-type]
+        img = fn.resize(img, resize_x=image_size, resize_y=image_size)  # type: ignore[arg-type]
         return img
     def dali_random_gaussian_blur(img, window_size):
         img = fn.gaussian_blur(img, window_size=window_size * 2 + 1)
         return img
     def dali_random_gray(img, prob_gray):
         saturate = fn.random.coin_flip(probability=1 - prob_gray)
-        saturate = fn.cast(saturate, dtype=types.FLOAT)
+        saturate = fn.cast(saturate, dtype=types.FLOAT)  # type: ignore[attr-defined]
         img = fn.hsv(img, saturation=saturate)
         return img
     def dali_random_hsv(img, hue, saturation):
@@ -353,33 +383,111 @@ def dali_data_iter(
         return condition * true_case + neg_condition * false_case
 
     condition_resize = fn.random.coin_flip(probability=0.1)
-    size_resize = fn.random.uniform(range=(int(112 * 0.5), int(112 * 0.8)), dtype=types.FLOAT)
+    size_resize = fn.random.uniform(range=(int(112 * 0.5), int(112 * 0.8)), dtype=types.FLOAT)  # type: ignore[attr-defined]
     condition_blur = fn.random.coin_flip(probability=0.2)
-    window_size_blur = fn.random.uniform(range=(1, 2), dtype=types.INT32)
+    window_size_blur = fn.random.uniform(range=(1, 2), dtype=types.INT32)  # type: ignore[attr-defined]
     condition_flip = fn.random.coin_flip(probability=0.5)
     condition_hsv = fn.random.coin_flip(probability=0.2)
-    hsv_hue = fn.random.uniform(range=(0., 20.), dtype=types.FLOAT)
-    hsv_saturation = fn.random.uniform(range=(1., 1.2), dtype=types.FLOAT)
+    hsv_hue = fn.random.uniform(range=(0., 20.), dtype=types.FLOAT)  # type: ignore[attr-defined]
+    hsv_saturation = fn.random.uniform(range=(1., 1.2), dtype=types.FLOAT)  # type: ignore[attr-defined]
 
     pipe = Pipeline(
         batch_size=batch_size, num_threads=num_threads,
         device_id=local_rank, prefetch_queue_depth=prefetch_queue_depth, )
     condition_flip = fn.random.coin_flip(probability=0.5)
     with pipe:
-        jpegs, labels = fn.readers.mxnet(
-            path=rec_file, index_path=idx_file, initial_fill=initial_fill, 
-            num_shards=world_size, shard_id=rank,
-            random_shuffle=random_shuffle, pad_last_batch=False, name=name)
-        images = fn.decoders.image(jpegs, device="mixed", output_type=types.RGB)
+        # Select reader based on dataset_type
+        reader_type = (dataset_type or "imagefolder").lower()
+        if reader_type == "imagefolder":
+            jpegs, labels = fn.readers.file(
+                file_root=src,
+                random_shuffle=random_shuffle,
+                pad_last_batch=False,
+                name=name,
+                shard_id=rank,
+                num_shards=world_size,
+            )
+            images = fn.decoders.image(jpegs, device="mixed")
+        elif reader_type == "webdataset":
+            # Resolve shards list
+            from glob import glob as _glob
+            if os.path.isdir(src):
+                shards = sorted(_glob(os.path.join(src, "*.tar")))
+            elif os.path.isfile(src) and src.lower().endswith(".txt"):
+                with open(src, "r", encoding="utf-8") as _f:
+                    shards = [ln.strip() for ln in _f if ln.strip() and not ln.strip().startswith('#')]
+            else:
+                shards = [src]
+            if len(shards) == 0:
+                raise FileNotFoundError(f"No WebDataset shards found for: {src}")
+            wds_out = fn.readers.webdataset(
+                paths=shards,
+                ext=["jpg", "cls"],
+                random_shuffle=random_shuffle,
+                pad_last_batch=False,
+                name=name,
+                shard_id=rank,
+                num_shards=world_size,
+            )
+            # readers.webdataset returns a list of outputs; cast to appease type checker
+            jpegs = wds_out[0]  # type: ignore[index]
+            labels = wds_out[1]  # type: ignore[index]
+            images = fn.decoders.image(jpegs, device="mixed")
+        elif reader_type == "tfrecord":
+            # Basic TFRecord support requires matching index files and default feature keys
+            try:
+                import nvidia.dali.tfrecord as tfrec  # type: ignore
+                tfrec = _cast(_Any, tfrec)
+            except Exception as e:
+                raise RuntimeError("DALI TFRecord support requires nvidia.dali.tfrecord module") from e
+            # Infer paths and index_paths
+            if os.path.isdir(src):
+                tf_paths = sorted(glob(os.path.join(src, "*.tfrecord")))
+                idx_paths = [p + ".idx" if os.path.exists(p + ".idx") else p.replace(".tfrecord", ".idx") for p in tf_paths]
+            elif os.path.isfile(src) and src.lower().endswith(".txt"):
+                with open(src, "r", encoding="utf-8") as _f:
+                    tf_paths = [ln.strip() for ln in _f if ln.strip() and not ln.strip().startswith('#')]
+                idx_paths = [p + ".idx" if os.path.exists(p + ".idx") else p.replace(".tfrecord", ".idx") for p in tf_paths]
+            else:
+                tf_paths = [src]
+                idx_paths = [src + ".idx" if os.path.exists(src + ".idx") else src.replace(".tfrecord", ".idx")]
+            if not (len(tf_paths) == len(idx_paths) and len(tf_paths) > 0):
+                raise FileNotFoundError("TFRecord paths and index paths could not be resolved")
+            features = {
+                "image/encoded": tfrec.FixedLenFeature([], tfrec.string, ""),
+                "image/class/label": tfrec.FixedLenFeature([1], tfrec.int64, 0),
+            }
+            feature_names = list(features.keys())
+            outputs = fn.readers.tfrecord(
+                path=tf_paths,
+                index_path=idx_paths,
+                features=features,
+                random_shuffle=random_shuffle,
+                pad_last_batch=False,
+                name=name,
+                shard_id=rank,
+                num_shards=world_size,
+            )
+            # outputs are returned in the same order as features
+            jpegs = outputs[feature_names.index("image/encoded")]  # type: ignore[index]
+            labels = outputs[feature_names.index("image/class/label")]  # type: ignore[index]
+            images = fn.decoders.image(jpegs, device="mixed")
+        else:
+            # Fallback to old MXNet RecordIO if available
+            jpegs, labels = fn.readers.mxnet(
+                path=rec_file, index_path=idx_file, initial_fill=initial_fill, 
+                num_shards=world_size, shard_id=rank,
+                random_shuffle=random_shuffle, pad_last_batch=False, name=name)
+            images = fn.decoders.image(jpegs, device="mixed")
         if dali_aug:
-            images = fn.cast(images, dtype=types.UINT8)
+            images = fn.cast(images, dtype=types.UINT8)  # type: ignore[attr-defined]
             images = multiplexing(condition_resize, dali_random_resize(images, size_resize, image_size=112), images)
             images = multiplexing(condition_blur, dali_random_gaussian_blur(images, window_size_blur), images)
             images = multiplexing(condition_hsv, dali_random_hsv(images, hsv_hue, hsv_saturation), images)
             images = dali_random_gray(images, 0.1)
 
         images = fn.crop_mirror_normalize(
-            images, dtype=types.FLOAT, mean=mean, std=std, mirror=condition_flip)
+            images, dtype=types.FLOAT, mean=mean, std=std, mirror=condition_flip)  # type: ignore[attr-defined]
         pipe.set_outputs(images, labels)
     pipe.build()
     return DALIWarper(DALIClassificationIterator(pipelines=[pipe], reader_name=name, ))
