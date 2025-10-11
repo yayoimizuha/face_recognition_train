@@ -95,7 +95,7 @@ def main(args):
     )
 
     backbone = get_model(
-        cfg.network, dropout=0.0, fp16=cfg.fp16, num_features=cfg.embedding_size).cuda()
+        cfg.network, dropout=0.0, fp16=cfg.fp16, amp=cfg.amp, num_features=cfg.embedding_size).cuda()
 
     backbone = torch.nn.parallel.DistributedDataParallel(
         module=backbone, broadcast_buffers=False, device_ids=[local_rank], bucket_cap_mb=16,
@@ -117,7 +117,7 @@ def main(args):
     if cfg.optimizer == "sgd":
         module_partial_fc = PartialFC_V2(
             margin_loss, cfg.embedding_size, cfg.num_classes,
-            cfg.sample_rate, False)
+            cfg.sample_rate, False, amp=cfg.amp)
         module_partial_fc.train().cuda()
         # TODO the params of partial fc must be last in the params list
         opt = torch.optim.SGD(
@@ -127,7 +127,7 @@ def main(args):
     elif cfg.optimizer == "adamw":
         module_partial_fc = PartialFC_V2(
             margin_loss, cfg.embedding_size, cfg.num_classes,
-            cfg.sample_rate, False)
+            cfg.sample_rate, False, amp=cfg.amp)
         module_partial_fc.train().cuda()
         opt = torch.optim.AdamW(
             params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}],
@@ -185,7 +185,7 @@ def main(args):
             local_embeddings = backbone(img)
             loss: torch.Tensor = module_partial_fc(local_embeddings, local_labels)
 
-            if cfg.fp16:
+            if cfg.amp is not None:
                 amp.scale(loss).backward()
                 if global_step % cfg.gradient_acc == 0:
                     amp.unscale_(opt)
@@ -211,7 +211,7 @@ def main(args):
                     })
                     
                 loss_am.update(loss.item(), 1)
-                callback_logging(global_step, loss_am, epoch, cfg.fp16, lr_scheduler.get_last_lr()[0], amp)
+                callback_logging(global_step, loss_am, epoch, (cfg.amp is not None), lr_scheduler.get_last_lr()[0], amp)
 
                 if global_step % cfg.verbose == 0 and global_step > 0:
                     callback_verification(global_step, backbone)

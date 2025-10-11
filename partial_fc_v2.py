@@ -34,6 +34,7 @@ class PartialFC_V2(torch.nn.Module):
             num_classes: int,
             sample_rate: float = 1.0,
             fp16: bool = False,
+            amp: torch.dtype = torch.float16,
     ):
         """
         Paramenters:
@@ -56,6 +57,7 @@ class PartialFC_V2(torch.nn.Module):
         self.embedding_size = embedding_size
         self.sample_rate: float = sample_rate
         self.fp16 = fp16
+        self.amp_dtype = amp
         self.num_local: int = num_classes // self.world_size + int(
             self.rank < num_classes % self.world_size
         )
@@ -157,10 +159,11 @@ class PartialFC_V2(torch.nn.Module):
             weight = self.weight
 
         # Use device-appropriate autocast when enabled
-        with torch.autocast(device_type=embeddings.device.type, enabled=self.fp16):
+        with torch.autocast(device_type=embeddings.device.type, dtype=self.amp_dtype, enabled=True):
             norm_embeddings = normalize(embeddings)
             norm_weight_activated = normalize(weight)
             logits = linear(norm_embeddings, norm_weight_activated)
+        # keep logits in float32 after autocast to ensure stability
         if self.fp16:
             logits = logits.float()
         logits = logits.clamp(-1, 1)

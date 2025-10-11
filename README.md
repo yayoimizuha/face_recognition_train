@@ -65,3 +65,19 @@ config.rec = "/data/webdataset/shards/{000000..000127}.tar"
 - `edgeface_xxs_q`
 - `edgeface_s_gamma_05`
 - `resnet50k`
+
+## AMP Support Matrix (autocast / GradScaler)
+
+This repository expects you to set `config.amp` to a torch dtype directly (e.g., `torch.float16`, `torch.bfloat16`). AMP is not disabled on CPU, and no automatic fallback is performed when a dtype is unsupported by your environment. Please verify support on your setup (PyTorch/device/driver/BLAS).
+
+| Device | autocast | GradScaler | Recommended dtype | Notes |
+|---|---|---|---|---|
+| NVIDIA CUDA GPU | Supported (fp16, bf16) | Supported | bf16 or fp16 (depends on HW/model) | Use the dtype that matches your GPU capability and model stability. |
+| AMD ROCm GPU | Supported | Supported | bf16 (RDNA3+) or fp16 | bf16 availability may depend on ROCm version and hardware. |
+| Intel GPU (XPU / oneAPI) | Supported | Supported | bf16 | Ensure oneAPI/XPU stack is properly set up. |
+| CPU | Enabled (not disabled in this repo) | Enabled (torch.amp) | bf16 (if ISA supports), otherwise per-environment | No fallback is implemented; specifying an unsupported dtype will raise an error. |
+
+Quick usage
+- In your config file, set the dtype directly:
+	- `config.amp = torch.float16` or `config.amp = torch.bfloat16`
+- This repo enables autocast/GradScaler even on CPU. There is no automatic fallback on unsupported dtypes.

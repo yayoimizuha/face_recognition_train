@@ -136,7 +136,7 @@ def main(args):
     )
 
     backbone = get_model(
-        cfg.network, dropout=0.0, fp16=cfg.fp16, num_features=cfg.embedding_size).to(device)
+        cfg.network, dropout=0.0, fp16=cfg.fp16, amp=cfg.amp, num_features=cfg.embedding_size).to(device)
 
     ddp_device_ids = [local_rank] if device.type != "cpu" else None
     backbone = torch.nn.parallel.DistributedDataParallel(
@@ -161,7 +161,7 @@ def main(args):
     if cfg.optimizer == "sgd":
         module_partial_fc = PartialFC_V2(
             margin_loss, cfg.embedding_size, cfg.num_classes,
-            cfg.sample_rate, False)
+            cfg.sample_rate, False, amp=cfg.amp)
         module_partial_fc.train().to(device)
         # TODO the params of partial fc must be last in the params list
         opt = torch.optim.SGD(
@@ -171,7 +171,7 @@ def main(args):
     elif cfg.optimizer == "adamw":
         module_partial_fc = PartialFC_V2(
             margin_loss, cfg.embedding_size, cfg.num_classes,
-            cfg.sample_rate, False)
+            cfg.sample_rate, False, amp=cfg.amp)
         module_partial_fc.train().to(device)
         opt = torch.optim.AdamW(
             params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}],
@@ -218,7 +218,8 @@ def main(args):
     )
 
     loss_am = AverageMeter()
-    amp = GradScaler(device=device_type,enabled=(cfg.fp16 and device.type != "cpu"), growth_interval=100)
+    # Enable GradScaler when AMP dtype is set (also on CPU)
+    amp = GradScaler(device=device_type, enabled=(cfg.amp is not None), growth_interval=100)
 
     for epoch in range(start_epoch, cfg.num_epoch):
 

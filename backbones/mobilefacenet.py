@@ -86,10 +86,12 @@ class GDC(Module):
 
 
 class MobileFaceNet(Module):
-    def __init__(self, fp16=False, num_features=512, blocks=(1, 4, 6, 2), scale=2):
+    def __init__(self, fp16=False, num_features=512, blocks=(1, 4, 6, 2), scale=2, amp: torch.dtype = torch.float16):
         super(MobileFaceNet, self).__init__()
         self.scale = scale
         self.fp16 = fp16
+        # Always expect a valid torch dtype (float16 or bfloat16)
+        self.amp_dtype = amp
         self.layers = nn.ModuleList()
         self.layers.append(
             ConvBlock(3, 64 * self.scale, kernel=(3, 3), stride=(2, 2), padding=(1, 1))
@@ -132,17 +134,17 @@ class MobileFaceNet(Module):
                     m.bias.data.zero_()
 
     def forward(self, x):
-        # Autocast on the actual input device; disable on CPU
-        with torch.autocast(device_type=x.device.type, enabled=self.fp16 and x.device.type != "cpu"):
+        # Autocast on the actual input device; do not disable on CPU
+        with torch.autocast(device_type=x.device.type, dtype=self.amp_dtype, enabled=True):
             for func in self.layers:
                 x = func(x)
-        x = self.conv_sep(x.float() if self.fp16 else x)
+        # Simpler: always feed float32 to the final conv block (no-op if already float32)
+        x = self.conv_sep(x.float())
         x = self.features(x)
         return x
 
+def get_mbf(fp16, num_features, blocks=(1, 4, 6, 2), scale=2, amp: torch.dtype = torch.float16):
+    return MobileFaceNet(fp16, num_features, blocks, scale=scale, amp=amp)
 
-def get_mbf(fp16, num_features, blocks=(1, 4, 6, 2), scale=2):
-    return MobileFaceNet(fp16, num_features, blocks, scale=scale)
-
-def get_mbf_large(fp16, num_features, blocks=(2, 8, 12, 4), scale=4):
-    return MobileFaceNet(fp16, num_features, blocks, scale=scale)
+def get_mbf_large(fp16, num_features, blocks=(2, 8, 12, 4), scale=4, amp: torch.dtype = torch.float16):
+    return MobileFaceNet(fp16, num_features, blocks, scale=scale, amp=amp)

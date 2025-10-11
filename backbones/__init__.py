@@ -55,12 +55,14 @@ def get_model(name, **kwargs):
     elif name == "mbf":
         fp16 = kwargs.get("fp16", False)
         num_features = kwargs.get("num_features", 512)
-        return get_mbf(fp16=fp16, num_features=num_features)
+        amp = kwargs.get("amp", torch.float16)
+        return get_mbf(fp16=fp16, num_features=num_features, amp=amp)
 
     elif name == "mbf_large":
         fp16 = kwargs.get("fp16", False)
         num_features = kwargs.get("num_features", 512)
-        return get_mbf_large(fp16=fp16, num_features=num_features)
+        amp = kwargs.get("amp", torch.float16)
+        return get_mbf_large(fp16=fp16, num_features=num_features, amp=amp)
     
     elif name.startswith('hf-hub:'):
         return get_timmfrv2(name, batchnorm=False)

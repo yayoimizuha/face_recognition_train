@@ -27,7 +27,10 @@ config.device_type = "cuda"
 config.sample_rate = 1
 config.interclass_filtering_threshold = 0
 
+# Legacy flag (deprecated): use config.amp instead. If True, it maps to torch.float16.
 config.fp16 = False
+# AMP dtype selection: set torch dtype directly (e.g., torch.bfloat16, torch.float16) or None to disable
+config.amp = None
 config.batch_size = 128
 
 # For SGD 

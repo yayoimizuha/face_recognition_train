@@ -1,4 +1,5 @@
 from easydict import EasyDict as edict
+import torch
 
 config = edict()
 config.margin_list = (1.0, 0.0, 0.4)
@@ -8,12 +9,13 @@ config.resume = False
 config.output = "./work_dirs/glint360k_mbf_hf"
 config.embedding_size = 512
 config.sample_rate = 1.0
-config.fp16 = True
+config.fp16 = True  # legacy flag; kept for backward compatibility
+config.amp = torch.float16  # set torch dtype directly
 config.momentum = 0.9
 config.weight_decay = 1e-4
 config.batch_size = 128
 config.lr = 0.1
-config.verbose = 2000
+config.verbose = 200
 config.dali = False
 # DataLoader 用
 config.num_workers = 2
@@ -28,3 +30,4 @@ config.num_image = 17091657
 config.num_epoch = 20
 config.warmup_epoch = 0
 config.val_targets = ['lfw', 'cfp_fp', "agedb_30"]
+config.val_dir = "/mnt/nvme/data1/"

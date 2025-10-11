@@ -68,10 +68,12 @@ class IResNet(nn.Module):
     fc_scale = 7 * 7
     def __init__(self,
                  block, layers, dropout=0, num_features=512, zero_init_residual=False,
-                 groups=1, width_per_group=64, replace_stride_with_dilation=None, fp16=False):
+                 groups=1, width_per_group=64, replace_stride_with_dilation=None, fp16=False, amp: torch.dtype = torch.float16):
         super(IResNet, self).__init__()
         self.extra_gflops = 0.0
+        # fp16 legacy boolean kept for backward compat; prefer amp dtype
         self.fp16 = fp16
+        self.amp_dtype = amp
         self.inplanes = 64
         self.dilation = 1
         if replace_stride_with_dilation is None:
@@ -146,8 +148,8 @@ class IResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        # Use autocast on the input tensor's device type (cuda/xpu/cpu)
-        with torch.autocast(device_type=x.device.type, enabled=self.fp16 and x.device.type != "cpu"):
+        # Use autocast on the input tensor's device type (cuda/xpu/cpu); do not disable on CPU
+        with torch.autocast(device_type=x.device.type, dtype=self.amp_dtype, enabled=True):
             x = self.conv1(x)
             x = self.bn1(x)
             x = self.prelu(x)
@@ -158,8 +160,9 @@ class IResNet(nn.Module):
             x = self.bn2(x)
             x = torch.flatten(x, 1)
             x = self.dropout(x)
-        x = self.fc(x.float() if self.fp16 else x)
-        x = self.features(x)
+            # Simpler: always feed float32 to the final FC (no-op if already float32)
+            x = self.fc(x.float())
+            x = self.features(x)
         return x
 
 
