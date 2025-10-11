@@ -73,7 +73,7 @@ class TimmFRWrapperV2(nn.Module):
         self.model_name = model_name
 
         self.model = timm.create_model(self.model_name, pretrained=pretrained)
-        self.model.reset_classifier(self.featdim)
+        self.model.reset_classifier(self.featdim) #type: ignore
 
     def forward(self, x):
         x = self.model(x)

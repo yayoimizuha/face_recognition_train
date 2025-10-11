@@ -136,7 +136,7 @@ def main(args):
     )
 
     backbone = get_model(
-        cfg.network, dropout=0.0, fp16=cfg.fp16, amp=cfg.amp, num_features=cfg.embedding_size).to(device)
+        cfg.network, dropout=0.0, amp=cfg.amp, num_features=cfg.embedding_size).to(device)
 
     ddp_device_ids = [local_rank] if device.type != "cpu" else None
     backbone = torch.nn.parallel.DistributedDataParallel(
