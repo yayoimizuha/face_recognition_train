@@ -85,3 +85,105 @@ def get_timmfrv2(model_name, **kwargs):
     Create an instance of TimmFRWrapperV2 with the specified `model_name` and additional arguments passed as `kwargs`.
     """
     return TimmFRWrapperV2(model_name=model_name, **kwargs)
+
+
+class GDConv1x1Head(nn.Module):
+    """
+    Global Depthwise Convolution followed by 1x1 Convolution to produce embeddings.
+
+    This module expects a spatial feature map of shape (B, C, H, W). It applies:
+      - Depthwise Conv2d with kernel size (H, W), stride=1, padding=0, groups=C
+      - 1x1 Conv2d to project channels to the embedding dimension
+      - Flatten to (B, E)
+    """
+
+    def __init__(self, in_channels: int, embedding_dim: int, kernel_size: tuple[int, int], bias: bool = False):
+        super().__init__()
+        kh, kw = kernel_size
+        self.gdconv = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size=(kh, kw),
+            stride=1,
+            padding=0,
+            groups=in_channels,
+            bias=False,
+        )
+        self.conv1x1 = nn.Conv2d(
+            in_channels,
+            embedding_dim,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W)
+        x = self.gdconv(x)  # (B, C, 1, 1)
+        x = self.conv1x1(x)  # (B, E, 1, 1)
+        x = x.flatten(1)  # (B, E)
+        return x
+
+
+class TimmFRWithGDHead(nn.Module):
+    """
+    Wrap timm model and replace the GAP + FC head with GDConv + 1x1 Conv.
+
+    The underlying timm model is used up to its spatial feature map (via forward_features).
+    The GDConv+1x1 head is instantiated lazily on first forward based on feature map size.
+    """
+
+    def __init__(self, model_name: str = 'edgenext_x_small', featdim: int = 512, pretrained: bool = True, bias: bool = False, input_size: tuple[int, int] = (112, 112)):
+        super().__init__()
+        self.model_name = model_name
+        self.featdim = featdim
+        self.bias = bias
+        self.input_size = input_size
+        # Create a timm model as a pure feature extractor (no classifier/global pool)
+        self.model = timm.create_model(self.model_name, pretrained=pretrained, num_classes=0, global_pool='')
+        # Build GDConv head immediately based on a dummy 112x112 input
+        self.head: nn.Module | None = None
+        self._init_head_with_dummy()
+
+    def _extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        if hasattr(self.model, 'forward_features') and callable(getattr(self.model, 'forward_features')):
+            return self.model.forward_features(x)  # type: ignore[attr-defined]
+        # As a last resort, try the plain forward and assume it returns spatial features
+        return self.model(x)
+
+    def _init_head_with_dummy(self):
+        # Run a dummy forward to infer (C,H,W) for the given input size
+        was_training = self.model.training
+        self.model.eval()
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, self.input_size[0], self.input_size[1])
+            feat = self._extract_features(dummy)
+            if feat.dim() != 4:
+                raise RuntimeError(f"Expected spatial features (B,C,H,W) but got shape {tuple(feat.shape)}")
+            _, c, h, w = feat.shape
+            self.head = GDConv1x1Head(in_channels=c, embedding_dim=self.featdim, kernel_size=(h, w), bias=self.bias)
+        if was_training:
+            self.model.train()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = self._extract_features(x)
+        assert self.head is not None
+        x = self.head(feat)
+        return x
+
+
+def get_timmfr_gdconv(model_name: str, **kwargs) -> nn.Module:
+    """
+    Create a timm-based face recognition backbone where the standard GAP + FC head is
+    replaced with GDConv + 1x1 Conv that outputs embeddings of dimension `featdim`.
+
+    Parameters (kwargs):
+      - featdim (int): embedding dimension (default 512)
+      - pretrained (bool): load pretrained weights for the timm backbone (default True)
+      - bias (bool): whether to use bias in the final 1x1 conv (default False)
+
+    Returns:
+      nn.Module: a model that maps (B,3,H,W) -> (B, featdim)
+    """
+    return TimmFRWithGDHead(model_name=model_name, **kwargs)

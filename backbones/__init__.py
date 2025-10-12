@@ -11,7 +11,7 @@ located in the parent directory of this source code repository.
 For inquiries, please contact the author at anjith.george@idiap.ch
 ===============================================================================
 """
-from .timmfr import get_timmfrv2, replace_linear_with_lowrank_2, replace_activation_function
+from .timmfr import get_timmfrv2, replace_linear_with_lowrank_2, replace_activation_function, get_timmfr_gdconv
 from .iresnet import iresnet18, iresnet34, iresnet50, iresnet100, iresnet200
 from .mobilefacenet import get_mbf,get_mbf_large
 
@@ -19,8 +19,12 @@ import torch
 
 
 def get_model(name, **kwargs):
+    # sanitize kwargs for GDConv variant (remove unsupported args)
+
+
     if name == "r50":
         return iresnet50(False, **kwargs)
+
     elif name == 'edgeface_xs_gamma_06':
         return replace_linear_with_lowrank_2(get_timmfrv2('edgenext_x_small', batchnorm=False, **kwargs), rank_ratio=0.6)
     elif name == 'edgeface_xs_q':
@@ -64,6 +68,14 @@ def get_model(name, **kwargs):
         amp = kwargs.get("amp", torch.float16)
         return get_mbf_large(fp16=fp16, num_features=num_features, amp=amp)
     
+    elif name.startswith('hf-hub:gdconv:'):
+        # Example: 'hf-hub:gdconv:owner/repo-or-model-id'
+        model_id = name.split(':', 2)[2]
+        return get_timmfr_gdconv(f'hf-hub:{model_id}', **kwargs)
+    elif name.startswith('gdconv:'):
+        # Example: 'gdconv:edgenext_x_small'
+        model_id = name.split(':', 1)[1]
+        return get_timmfr_gdconv(model_id, **kwargs)
     elif name.startswith('hf-hub:'):
         return get_timmfrv2(name, batchnorm=False, **kwargs)
 
