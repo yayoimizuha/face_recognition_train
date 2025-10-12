@@ -67,12 +67,12 @@ class TimmFRWrapperV2(nn.Module):
     Wraps timm model
     """
 
-    def __init__(self, model_name='edgenext_x_small', featdim=512, batchnorm=False, pretrained=True):
+    def __init__(self, model_name='edgenext_x_small', featdim=512, batchnorm=False, pretrained=True, dropout: float = 0.0):
         super().__init__()
         self.featdim = featdim
         self.model_name = model_name
 
-        self.model = timm.create_model(self.model_name, pretrained=pretrained)
+        self.model = timm.create_model(self.model_name, pretrained=pretrained, drop_rate=dropout)
         self.model.reset_classifier(self.featdim) #type: ignore
 
     def forward(self, x):
@@ -134,14 +134,14 @@ class TimmFRWithGDHead(nn.Module):
     The GDConv+1x1 head is instantiated lazily on first forward based on feature map size.
     """
 
-    def __init__(self, model_name: str = 'edgenext_x_small', featdim: int = 512, pretrained: bool = True, bias: bool = False, input_size: tuple[int, int] = (112, 112)):
+    def __init__(self, model_name: str = 'edgenext_x_small', featdim: int = 512, pretrained: bool = True, bias: bool = False, input_size: tuple[int, int] = (112, 112), dropout: float = 0.0, batchnorm: bool = False):
         super().__init__()
         self.model_name = model_name
         self.featdim = featdim
         self.bias = bias
         self.input_size = input_size
         # Create a timm model as a pure feature extractor (no classifier/global pool)
-        self.model = timm.create_model(self.model_name, pretrained=pretrained, num_classes=0, global_pool='')
+        self.model = timm.create_model(self.model_name, pretrained=pretrained, num_classes=0, global_pool='', drop_rate=dropout)
         # Build GDConv head immediately based on a dummy 112x112 input
         self.head: nn.Module | None = None
         self._init_head_with_dummy()
