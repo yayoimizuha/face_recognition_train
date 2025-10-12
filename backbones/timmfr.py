@@ -79,7 +79,8 @@ class TimmFRWrapperV2(nn.Module):
     def forward(self, x):
         with torch.autocast(device_type=x.device.type, dtype=self.amp_dtype, enabled=(self.amp_dtype is not None)):
             x = self.model(x)
-        return x
+        # Ensure embeddings are float32 for downstream modules (e.g., distributed all_gather)
+        return x.float()
 
 
 def get_timmfrv2(model_name, **kwargs):
@@ -174,7 +175,8 @@ class TimmFRWithGDHead(nn.Module):
             feat = self._extract_features(x)
             assert self.head is not None
             x = self.head(feat)
-        return x
+        # Ensure embeddings are float32 for downstream modules
+        return x.float()
 
 
 def get_timmfr_gdconv(model_name: str, **kwargs) -> nn.Module:
