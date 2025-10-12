@@ -67,16 +67,18 @@ class TimmFRWrapperV2(nn.Module):
     Wraps timm model
     """
 
-    def __init__(self, model_name='edgenext_x_small', featdim=512, batchnorm=False, pretrained=True, dropout: float = 0.0):
+    def __init__(self, model_name='edgenext_x_small', featdim=512, batchnorm=False, pretrained=True, dropout: float = 0.0, amp: torch.dtype | None = None):
         super().__init__()
         self.featdim = featdim
         self.model_name = model_name
+        self.amp_dtype = amp
 
         self.model = timm.create_model(self.model_name, pretrained=pretrained, drop_rate=dropout)
         self.model.reset_classifier(self.featdim) #type: ignore
 
     def forward(self, x):
-        x = self.model(x)
+        with torch.autocast(device_type=x.device.type, dtype=self.amp_dtype, enabled=(self.amp_dtype is not None)):
+            x = self.model(x)
         return x
 
 
@@ -134,12 +136,13 @@ class TimmFRWithGDHead(nn.Module):
     The GDConv+1x1 head is instantiated lazily on first forward based on feature map size.
     """
 
-    def __init__(self, model_name: str = 'edgenext_x_small', featdim: int = 512, pretrained: bool = True, bias: bool = False, input_size: tuple[int, int] = (112, 112), dropout: float = 0.0, batchnorm: bool = False):
+    def __init__(self, model_name: str = 'edgenext_x_small', featdim: int = 512, pretrained: bool = True, bias: bool = False, input_size: tuple[int, int] = (112, 112), dropout: float = 0.0, batchnorm: bool = False, amp: torch.dtype | None = None):
         super().__init__()
         self.model_name = model_name
         self.featdim = featdim
         self.bias = bias
         self.input_size = input_size
+        self.amp_dtype = amp
         # Create a timm model as a pure feature extractor (no classifier/global pool)
         self.model = timm.create_model(self.model_name, pretrained=pretrained, num_classes=0, global_pool='', drop_rate=dropout)
         # Build GDConv head immediately based on a dummy 112x112 input
@@ -167,9 +170,10 @@ class TimmFRWithGDHead(nn.Module):
             self.model.train()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feat = self._extract_features(x)
-        assert self.head is not None
-        x = self.head(feat)
+        with torch.autocast(device_type=x.device.type, dtype=self.amp_dtype, enabled=(self.amp_dtype is not None)):
+            feat = self._extract_features(x)
+            assert self.head is not None
+            x = self.head(feat)
         return x
 
 
