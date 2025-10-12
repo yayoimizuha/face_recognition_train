@@ -13,3 +13,4 @@ scripts/run_debug*
 wandb
 work_dirs
 .env
+gdconv&1x1.md

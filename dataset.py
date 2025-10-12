@@ -368,36 +368,24 @@ class SyntheticDataset(Dataset):
         return 1000000
 
 
-# WebDataset の 'cls' ラベルを int64 スカラー(形状[1])に正規化するための CPU 側関数
+# WebDataset の 'cls' ラベルを int64 スカラー(形状[1])に正規化（ASCII固定解釈）
 def _wds_label_to_int64_np(x):
     # x: np.ndarray(dtype=uint8, shape=(N,)) を想定
     if not isinstance(x, np.ndarray):
         x = np.asarray(x)
     if x.dtype != np.uint8:
         x = x.view(np.uint8)
-    x = x.ravel()
-    bs = x.tobytes()
+    bs = x.ravel().tobytes()
 
-    # 1) ASCII 数字と符号/空白のみで構成されていれば、文字列としてパース
-    if bs:
-        allowed = b"0123456789+- \t\r\n"
-        if set(bs) <= set(allowed):
-            s = bs.decode("ascii", errors="ignore").strip()
-            if s and s.lstrip("+-").isdigit():
-                val = int(s)
-                return np.array([np.int64(val)], dtype=np.int64)
-
-    # 2) バイナリ int64 (8 の倍数長を優先)
-    if len(bs) >= 8 and (len(bs) % 8 == 0):
-        val = np.frombuffer(bs, dtype=np.int64, count=1)[0]
-        return np.array([val], dtype=np.int64)
-
-    # 3) バイナリ int32 (4 の倍数長)
-    if len(bs) >= 4 and (len(bs) % 4 == 0):
-        val32 = np.frombuffer(bs, dtype=np.int32, count=1)[0]
-        return np.array([np.int64(val32)], dtype=np.int64)
-
-    raise RuntimeError("Unsupported WebDataset label encoding: expected ASCII integer or raw int64/int32 bytes.")
+    # ASCII のみ許可して数値化
+    allowed = b"0123456789+- \t\r\n"
+    if not bs or not set(bs) <= set(allowed):
+        raise RuntimeError("Label is not valid ASCII digits.")
+    s = bs.decode("ascii", errors="ignore").strip()
+    if not s or not s.lstrip("+-").isdigit():
+        raise RuntimeError("Label ASCII is not an integer.")
+    val = int(s)
+    return np.array([np.int64(val)], dtype=np.int64)
 
 def dali_data_iter(
     batch_size: int,
