@@ -14,6 +14,28 @@ from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from utils.utils_distributed_sampler import DistributedSampler
 from utils.utils_distributed_sampler import get_dist_info, worker_init_fn
+from nvidia.dali import types  # added
+
+
+class SafeImageFolder(ImageFolder):
+    """ImageFolder that ignores hidden directories (e.g., .cache) as classes.
+
+    Torchvision's default ImageFolder treats every subdirectory under the root
+    as a class. If a hidden folder like ".cache" exists and contains no valid
+    images, it raises FileNotFoundError. This subclass filters out directories
+    that start with a dot.
+    """
+
+    @classmethod
+    def find_classes(cls, directory: str):  # type: ignore[override]
+        classes = [
+            d.name
+            for d in os.scandir(directory)
+            if d.is_dir() and not d.name.startswith(".")
+        ]
+        classes.sort()
+        class_to_idx = {cls_name: i for i, cls_name in enumerate(classes)}
+        return classes, class_to_idx
 
 
 def get_dataloader(
@@ -31,6 +53,29 @@ def get_dataloader(
     train_set = None
     ds_type = (dataset_type or "imagefolder").lower()
 
+    transform = transforms.Compose([
+         transforms.RandomHorizontalFlip(),
+         transforms.ToTensor(),
+         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+         ])
+
+    # Synthetic
+    if root_dir == "synthetic":
+        train_set = SyntheticDataset()
+        dali = False
+
+    # If DALI is enabled, return DALI iterator immediately to avoid constructing
+    # any CPU-side dataset like ImageFolder that may scan hidden directories.
+    if dali:
+        return cast(Iterable, dali_data_iter(
+            batch_size=batch_size,
+            src=root_dir,
+            dataset_type=ds_type,
+            num_threads=2,
+            local_rank=local_rank,
+            dali_aug=dali_aug,
+            device_type=device_type))
+
     # Synthetic
     if root_dir == "synthetic":
         train_set = SyntheticDataset()
@@ -45,33 +90,14 @@ def get_dataloader(
 
     # Image Folder
     elif ds_type == "imagefolder" and not dali:
-        transform = transforms.Compose([
-             transforms.RandomHorizontalFlip(),
-             transforms.ToTensor(),
-             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-             ])
-        train_set = ImageFolder(root_dir, transform)
+        train_set = SafeImageFolder(root_dir, transform)
     elif not dali and ds_type == "tfrecord":
         raise ValueError("dataset_type='tfrecord' is no longer supported. Use 'imagefolder' or 'webdataset'.")
     else:
         # Fallback for unknown types when not using DALI
-        transform = transforms.Compose([
-             transforms.RandomHorizontalFlip(),
-             transforms.ToTensor(),
-             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-             ])
-        train_set = ImageFolder(root_dir, transform)
+        train_set = SafeImageFolder(root_dir, transform)
 
-    # DALI
-    if dali:
-        return cast(Iterable, dali_data_iter(
-            batch_size=batch_size,
-            src=root_dir,
-            dataset_type=ds_type,
-            num_threads=2,
-            local_rank=local_rank,
-            dali_aug=dali_aug,
-            device_type=device_type))
+    # DALI already handled above
 
     rank, world_size = get_dist_info()
     # IterableDataset (WebDataset) cannot use a Sampler; use internal sharding and shuffling
@@ -342,6 +368,37 @@ class SyntheticDataset(Dataset):
         return 1000000
 
 
+# WebDataset の 'cls' ラベルを int64 スカラー(形状[1])に正規化するための CPU 側関数
+def _wds_label_to_int64_np(x):
+    # x: np.ndarray(dtype=uint8, shape=(N,)) を想定
+    if not isinstance(x, np.ndarray):
+        x = np.asarray(x)
+    if x.dtype != np.uint8:
+        x = x.view(np.uint8)
+    x = x.ravel()
+    bs = x.tobytes()
+
+    # 1) ASCII 数字と符号/空白のみで構成されていれば、文字列としてパース
+    if bs:
+        allowed = b"0123456789+- \t\r\n"
+        if set(bs) <= set(allowed):
+            s = bs.decode("ascii", errors="ignore").strip()
+            if s and s.lstrip("+-").isdigit():
+                val = int(s)
+                return np.array([np.int64(val)], dtype=np.int64)
+
+    # 2) バイナリ int64 (8 の倍数長を優先)
+    if len(bs) >= 8 and (len(bs) % 8 == 0):
+        val = np.frombuffer(bs, dtype=np.int64, count=1)[0]
+        return np.array([val], dtype=np.int64)
+
+    # 3) バイナリ int32 (4 の倍数長)
+    if len(bs) >= 4 and (len(bs) % 4 == 0):
+        val32 = np.frombuffer(bs, dtype=np.int32, count=1)[0]
+        return np.array([np.int64(val32)], dtype=np.int64)
+
+    raise RuntimeError("Unsupported WebDataset label encoding: expected ASCII integer or raw int64/int32 bytes.")
+
 def dali_data_iter(
     batch_size: int,
     src: str,
@@ -371,11 +428,8 @@ def dali_data_iter(
     rank: int = distributed.get_rank()
     world_size: int = distributed.get_world_size()
     import nvidia.dali.fn as fn
-    import nvidia.dali.types as types  # type: ignore
     from nvidia.dali.pipeline import Pipeline
     from nvidia.dali.plugin.pytorch import DALIClassificationIterator
-    from typing import Any as _Any, cast as _cast
-    types = _cast(_Any, types)
 
     def dali_random_resize(img, resize_size, image_size=112):
         img = fn.resize(img, resize_x=resize_size, resize_y=resize_size)  # type: ignore[arg-type]
@@ -422,6 +476,8 @@ def dali_data_iter(
                 num_shards=world_size,
             )
             images = fn.decoders.image(jpegs, device="mixed")
+            labels = fn.cast(labels, dtype=types.INT64)
+            labels = fn.reshape(labels, shape=[1])
         elif reader_type == "webdataset":
             # Resolve shards list
             from glob import glob as _glob
@@ -447,6 +503,9 @@ def dali_data_iter(
             jpegs = wds_out[0]  # type: ignore[index]
             labels = wds_out[1]  # type: ignore[index]
             images = fn.decoders.image(jpegs, device="mixed")
+            # 可変長ASCII/バイナリを CPU 上で int64[1] に正規化（バッチ内で形状を揃える）
+            labels = fn.python_function(labels, function=_wds_label_to_int64_np, batch_processing=False)
+            # すでに (1,) を返すので追加の reshape は不要
         else:
             raise ValueError(
                 f"Unsupported dataset_type='{reader_type}' for DALI. Use 'imagefolder' or 'webdataset'."
@@ -458,11 +517,28 @@ def dali_data_iter(
             images = multiplexing(condition_hsv, dali_random_hsv(images, hsv_hue, hsv_saturation), images)
             images = dali_random_gray(images, 0.1)
 
+        # Ensure uniform image size across the batch for tensorization
+        images = fn.resize(images, resize_x=112, resize_y=112)
+
+        # Help static type checker: DALI accepts DataNode here
+        images = cast(Any, images)
         images = fn.crop_mirror_normalize(
-            images, dtype=types.FLOAT, mean=mean, std=std, mirror=condition_flip)  # type: ignore[attr-defined]
+            images,
+            dtype=types.FLOAT,
+            mean=mean,
+            std=std,
+            mirror=condition_flip,
+            output_layout="CHW",
+        )  # type: ignore[attr-defined, arg-type]
         pipe.set_outputs(images, labels)
     pipe.build()
-    return DALIWarper(DALIClassificationIterator(pipelines=[pipe], reader_name=name, ), device_type=device_type)
+    return DALIWarper(
+        DALIClassificationIterator(
+            pipelines=[pipe],
+            reader_name=name,
+            ),
+        device_type=device_type
+    )
 
 
 class DALIWarper(object):

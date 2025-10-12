@@ -34,6 +34,31 @@ def _detect_device_type() -> str:
         return "cuda"
     return "cpu"
 
+# Intel MPI/PMI/OMPI 環境変数を PyTorch の env:// 用に補完・マッピング
+def _setup_mpi_env_for_torch() -> None:
+    env = os.environ
+    # RANK
+    if "RANK" not in env:
+        for k in ("PMI_RANK", "OMPI_COMM_WORLD_RANK", "MPI_RANKID"):
+            if k in env:
+                env["RANK"] = env[k]
+                break
+    # WORLD_SIZE
+    if "WORLD_SIZE" not in env:
+        for k in ("PMI_SIZE", "OMPI_COMM_WORLD_SIZE"):
+            if k in env:
+                env["WORLD_SIZE"] = env[k]
+                break
+    # LOCAL_RANK
+    if "LOCAL_RANK" not in env:
+        for k in ("MPI_LOCALRANKID", "OMPI_COMM_WORLD_LOCAL_RANK"):
+            if k in env:
+                env["LOCAL_RANK"] = env[k]
+                break
+    # MASTER_PORT は未設定ならデフォルトを補完
+    if "WORLD_SIZE" in env and env["WORLD_SIZE"].isdigit() and int(env["WORLD_SIZE"]) > 1:
+        env.setdefault("MASTER_PORT", "29500")
+        env.setdefault("MASTER_ADDR", "127.0.0.1")
 
 def main(args):
     # get config
@@ -41,11 +66,10 @@ def main(args):
     # global control random seed
     setup_seed(seed=cfg.seed, cuda_deterministic=False)
 
-    # decide device from config or auto-detect
-    cfg_device = getattr(cfg, "device_type", None)
-    requested_device = (cfg_device or "").lower() if isinstance(cfg_device, str) else None
+    # decide device from config or auto-detect（getattr廃止）
+    requested_device = cfg.device_type.lower()
     detected_device = _detect_device_type()
-    device_type = requested_device or detected_device
+    device_type = requested_device
     # validate availability; if requested but unavailable, fall back
     if requested_device == "cuda" and not torch.cuda.is_available():
         logging.warning("Requested device 'cuda' is unavailable. Falling back to detected '%s'", detected_device)
@@ -54,20 +78,30 @@ def main(args):
         logging.warning("Requested device 'xpu' is unavailable. Falling back to detected '%s'", detected_device)
         device_type = detected_device
 
-    # Select backend by device
-    if device_type == "xpu":
-        dist_backend = "ccl"  # oneCCL for Intel XPU
-    elif device_type == "cuda":
-        dist_backend = "nccl"  # CUDA/ROCm
-    else:
-        dist_backend = "gloo"  # CPU fallback
+    # Select backend from config（auto廃止・未知は即クラッシュ）
+    rb = cfg.dist_backend.lower()
+    if rb not in ("gloo", "nccl", "ccl"):
+        raise ValueError(f"Unsupported dist_backend: {cfg.dist_backend}")
+    dist_backend = rb
+
+    # backend 可用性の検証とフォールバック
+    if dist_backend == "nccl" and not torch.cuda.is_available():
+        logging.warning("NCCL requested/selected but CUDA is unavailable. Falling back to 'gloo'.")
+        dist_backend = "gloo"
+    if dist_backend == "ccl":
+        try:
+            import oneccl_bindings_for_pytorch  # noqa: F401
+        except Exception as e:
+            logging.warning("oneCCL backend 'ccl' is not available (%s). Falling back to 'gloo'.", e)
+            dist_backend = "gloo"
 
     # init process group
+    _setup_mpi_env_for_torch()
     try:
         rank = int(os.environ["RANK"])
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
-        distributed.init_process_group(dist_backend)
+        distributed.init_process_group(backend=dist_backend, init_method="env://")
     except KeyError:
         rank = 0
         local_rank = 0
@@ -141,7 +175,8 @@ def main(args):
     ddp_device_ids = [local_rank] if device.type != "cpu" else None
     backbone = torch.nn.parallel.DistributedDataParallel(
         module=backbone, broadcast_buffers=False, device_ids=ddp_device_ids, bucket_cap_mb=16,
-        find_unused_parameters=True)
+        find_unused_parameters=False  # _set_static_graph()で未使用パラメータを自動処理するためFalseに
+    )
     # NCCL 環境のみ fp16 圧縮フックを使用（他 backend では未対応/非推奨）
     if dist_backend == "nccl":
         backbone.register_comm_hook(None, fp16_compress_hook)

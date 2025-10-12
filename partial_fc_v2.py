@@ -195,11 +195,13 @@ class DistCrossEntropyFunc(torch.autograd.Function):
         logits.div_(sum_logits_exp)
         index = torch.where(label != -1)[0]
         # loss
-        loss = torch.zeros(batch_size, 1, device=logits.device)
+        # keep loss dtype consistent with logits to avoid dtype mismatch under AMP
+        loss = torch.zeros(batch_size, 1, device=logits.device, dtype=logits.dtype)
         loss[index] = logits[index].gather(1, label[index])
         distributed.all_reduce(loss, distributed.ReduceOp.SUM)
         ctx.save_for_backward(index, logits, label)
-        return loss.clamp_min_(1e-30).log_().mean() * (-1)
+        # compute final scalar loss in float32 for numerical stability
+        return loss.float().clamp_min_(1e-30).log_().mean() * (-1)
 
     @staticmethod
     def backward(ctx, loss_gradient):
@@ -216,10 +218,11 @@ class DistCrossEntropyFunc(torch.autograd.Function):
             label,
         ) = ctx.saved_tensors
         batch_size = logits.size(0)
+        # keep one_hot dtype consistent with logits for safe in-place ops and gradient dtype
         one_hot = torch.zeros(
-            size=[index.size(0), logits.size(1)], device=logits.device
+            size=[index.size(0), logits.size(1)], device=logits.device, dtype=logits.dtype
         )
-        one_hot.scatter_(1, label[index], 1)
+        one_hot.scatter_(1, label[index], 1.0)
         logits[index] -= one_hot
         logits.div_(batch_size)
         return logits * loss_gradient.item(), None

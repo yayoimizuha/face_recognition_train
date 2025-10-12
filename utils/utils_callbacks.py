@@ -1,7 +1,7 @@
 import logging
 import os
 import time
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -33,8 +33,8 @@ class CallBackVerification(object):
             logging.info('[%s][%d]XNorm: %f' % (self.ver_name_list[i], global_step, xnorm))
             logging.info('[%s][%d]Accuracy-Flip: %1.5f+-%1.5f' % (self.ver_name_list[i], global_step, acc2, std2))
 
-            self.summary_writer: SummaryWriter
-            self.summary_writer.add_scalar(tag=self.ver_name_list[i], scalar_value=acc2, global_step=global_step, )
+            if self.summary_writer is not None:
+                self.summary_writer.add_scalar(tag=self.ver_name_list[i], scalar_value=acc2, global_step=global_step, )
             if self.wandb_logger:
                 import wandb
                 self.wandb_logger.log({
@@ -45,7 +45,7 @@ class CallBackVerification(object):
                 })
 
             if acc2 > self.highest_acc_list[i]:
-                self.highest_acc_list[i] = acc2
+                self.highest_acc_list[i] = float(acc2)
             logging.info(
                 '[%s][%d]Accuracy-Highest: %1.5f' % (self.ver_name_list[i], global_step, self.highest_acc_list[i]))
             results.append(acc2)
@@ -79,6 +79,43 @@ class CallBackLogging(object):
         self.init = False
         self.tic = 0
 
+    @staticmethod
+    def _format_eta(eta_seconds: int) -> str:
+        """Format remaining seconds into a compact string 'Xday,Yhour,Zmin,Wsec'.
+        Rules:
+        - If < 1 day, omit 'day'.
+        - If < 1 hour, omit 'hour'.
+        - If < 1 minute, omit 'min'.
+        - Always include seconds.
+        The displayed units start from the highest included unit down to seconds.
+        """
+        if eta_seconds < 0:
+            eta_seconds = 0
+        days = eta_seconds // 86400
+        rem = eta_seconds % 86400
+        hours = rem // 3600
+        rem %= 3600
+        minutes = rem // 60
+        seconds = rem % 60
+
+        parts: List[str] = []
+        if days > 0:
+            parts.append(f"{days}day")
+            parts.append(f"{hours}hour")
+            parts.append(f"{minutes}min")
+            parts.append(f"{seconds}sec")
+        elif hours > 0:
+            parts.append(f"{hours}hour")
+            parts.append(f"{minutes}min")
+            parts.append(f"{seconds}sec")
+        elif minutes > 0:
+            parts.append(f"{minutes}min")
+            parts.append(f"{seconds}sec")
+        else:
+            parts.append(f"{seconds}sec")
+
+        return ",".join(parts)
+
     def __call__(self,
                  global_step: int,
                  loss: AverageMeter,
@@ -102,20 +139,21 @@ class CallBackLogging(object):
                 time_sec_avg = time_sec / (global_step - self.start_step + 1)
                 eta_sec = time_sec_avg * (self.total_step - global_step - 1)
                 time_for_end = eta_sec / 3600
+                eta_formatted = self._format_eta(int(eta_sec))
                 if self.writer is not None:
                     self.writer.add_scalar('time_for_end', time_for_end, global_step)
                     self.writer.add_scalar('learning_rate', learning_rate, global_step)
                     self.writer.add_scalar('loss', loss.avg, global_step)
                 if fp16:
                     msg = "Speed %.2f samples/sec   Loss %.4f   LearningRate %.6f   Epoch: %d   Global Step: %d   " \
-                          "Fp16 Grad Scale: %2.f   Required: %1.f hours" % (
+                          "Fp16 Grad Scale: %2.f   Required: %s" % (
                               speed_total, loss.avg, learning_rate, epoch, global_step,
-                              grad_scaler.get_scale(), time_for_end
+                              grad_scaler.get_scale(), eta_formatted
                           )
                 else:
                     msg = "Speed %.2f samples/sec   Loss %.4f   LearningRate %.6f   Epoch: %d   Global Step: %d   " \
-                          "Required: %1.f hours" % (
-                              speed_total, loss.avg, learning_rate, epoch, global_step, time_for_end
+                          "Required: %s" % (
+                              speed_total, loss.avg, learning_rate, epoch, global_step, eta_formatted
                           )
                 logging.info(msg)
                 loss.reset()
