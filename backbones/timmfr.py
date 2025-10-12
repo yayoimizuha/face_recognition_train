@@ -67,9 +67,9 @@ class TimmFRWrapperV2(nn.Module):
     Wraps timm model
     """
 
-    def __init__(self, model_name='edgenext_x_small', featdim=512, batchnorm=False, pretrained=True, dropout: float = 0.0, amp: torch.dtype | None = None):
+    def __init__(self, model_name='edgenext_x_small', num_features=512, batchnorm=False, pretrained=True, dropout: float = 0.0, amp: torch.dtype | None = None):
         super().__init__()
-        self.featdim = featdim
+        self.featdim = num_features
         self.model_name = model_name
         self.amp_dtype = amp
 
@@ -136,10 +136,10 @@ class TimmFRWithGDHead(nn.Module):
     The GDConv+1x1 head is instantiated lazily on first forward based on feature map size.
     """
 
-    def __init__(self, model_name: str = 'edgenext_x_small', featdim: int = 512, pretrained: bool = True, bias: bool = False, input_size: tuple[int, int] = (112, 112), dropout: float = 0.0, batchnorm: bool = False, amp: torch.dtype | None = None):
+    def __init__(self, model_name: str = 'edgenext_x_small', num_features: int = 512, pretrained: bool = True, bias: bool = False, input_size: tuple[int, int] = (112, 112), dropout: float = 0.0, batchnorm: bool = False, amp: torch.dtype | None = None):
         super().__init__()
         self.model_name = model_name
-        self.featdim = featdim
+        self.featdim = num_features
         self.bias = bias
         self.input_size = input_size
         self.amp_dtype = amp
