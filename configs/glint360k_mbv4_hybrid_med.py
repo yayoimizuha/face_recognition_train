@@ -18,7 +18,7 @@ config.weight_decay = 1e-4
 config.batch_size = 128
 config.lr = 0.1
 config.verbose = 2000
-config.dali = True
+config.dali = False
 # DataLoader 用
 config.num_workers = 5
 # DALI 増強は無効（HF の DataLoader を使用）
