@@ -24,7 +24,7 @@ config.num_workers = 5
 # DALI 増強は無効（HF の DataLoader を使用）
 config.dali_aug = False
 config.dataset_type = "webdataset"
-config.rec = "/mnt/nvme/Glint360k_WebDataset/"
+config.rec = "/home/tomokazu/Glint360k_WebDataset/"
 
 # Glint360k のクラス数と画像枚数（スケジューラ計算用）
 config.num_classes = 360232
