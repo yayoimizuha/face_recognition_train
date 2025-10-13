@@ -31,16 +31,6 @@ def get_model(name, **kwargs):
         model = get_timmfrv2('edgenext_x_small', batchnorm=False, **kwargs)
         model = torch.quantization.quantize_dynamic(model, qconfig_spec={torch.nn.Linear}, dtype=torch.qint8)
         return model
-    elif name == 'edgeface_xxs':
-        return get_timmfrv2('edgenext_xx_small', batchnorm=False, **kwargs)
-    elif name == 'convnext-large':
-        return get_timmfrv2('convnext_large.fb_in22k_ft_in1k', batchnorm=False, **kwargs)
-    elif name == 'edgeface_base':
-        return get_timmfrv2('edgenext_base', batchnorm=False, **kwargs)
-    elif name == 'mobilenetv4_conv_medium':
-        return get_timmfrv2('mobilenetv4_conv_medium', batchnorm=False, **kwargs)
-    elif name == 'mobilenetv4_hybrid_medium':
-        return get_timmfrv2('mobilenetv4_hybrid_medium', batchnorm=False, **kwargs)
     elif name == 'mobilenetv4_hybrid_medium_silu':
         model = get_timmfrv2('mobilenetv4_hybrid_medium', batchnorm=False, **kwargs)
         replace_activation_function(model, torch.nn.ReLU, torch.nn.SiLU)
@@ -78,9 +68,8 @@ def get_model(name, **kwargs):
         return get_timmfr_gdconv(model_id, **kwargs)
     elif name.startswith('hf-hub:'):
         return get_timmfrv2(name, batchnorm=False, **kwargs)
-
     else:
-        raise ValueError()
+        return get_timmfrv2(name, batchnorm=False, **kwargs)
 
 # add MobileFaceNet Backbone
 # https://github.com/deepinsight/insightface/blob/master/recognition/arcface_torch/backbones/mobilefacenet.py
