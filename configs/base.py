@@ -44,6 +44,14 @@ config.weight_decay = 5e-4
 # config.lr = 0.001
 # config.weight_decay = 0.1
 
+# For Muon (MomentUm Orthogonalized by Newton-schulz)
+# Muon is particularly effective for 2D parameters (weights)
+# Recommended settings:
+# config.optimizer = "muon"
+# config.lr = 0.02
+# config.momentum = 0.95
+# config.nesterov = True
+
 config.verbose = 2000
 config.frequent = 10
 

@@ -37,6 +37,59 @@ After finishing this step, launch:
 torchrun --nproc_per_node=4 train_v2_restart.py configs/edgeface_xs_gamma_06_restart.py
 ```
 
+### Using Muon Optimizer
+
+This repository now supports the **Muon optimizer** (MomentUm Orthogonalized by Newton-schulz), a novel optimizer that combines momentum-based updates with Newton-Schulz orthogonalization.
+
+#### What is Muon?
+
+Muon is particularly effective for training deep neural networks with 2D parameters (weight matrices). It provides:
+
+- **Better convergence**: Often converges faster than SGD/Adam on certain architectures
+- **Implicit regularization**: Newton-Schulz orthogonalization acts as regularization
+- **Stability**: More stable training dynamics
+- **Effectiveness for CNNs and Transformers**: Particularly strong for convolutional architectures
+
+#### Key Features
+
+- Uses Newton-Schulz iterations for matrix orthogonalization
+- Combines momentum-based gradient descent (with optional Nesterov)
+- Designed for 2D parameters (Linear, Conv layers)
+- Falls back to standard momentum for non-2D parameters (biases, BatchNorm)
+
+#### Usage Example
+
+```bash
+torchrun --nproc_per_node=4 train_v2.py configs/muon_example.py
+```
+
+#### Configuration
+
+In your config file:
+
+```python
+config.optimizer = "muon"
+config.lr = 0.02          # Typically higher than AdamW (0.01-0.05)
+config.momentum = 0.95    # High momentum recommended (0.90-0.95)
+config.nesterov = True    # Nesterov momentum improves convergence
+```
+
+See `configs/muon_example.py` for a complete example configuration.
+
+#### Recommended Hyperparameters
+
+| Parameter | Recommended Range | Default | Notes |
+|-----------|------------------|---------|-------|
+| `lr` | 0.01 - 0.05 | 0.02 | Higher than AdamW |
+| `momentum` | 0.90 - 0.95 | 0.95 | High momentum works well |
+| `nesterov` | True/False | True | Recommended to enable |
+
+#### When to Use Muon
+
+- **Good for**: CNNs, ResNets, Vision Transformers, face recognition models
+- **Better than AdamW**: When you have well-structured 2D parameters
+- **Consider AdamW**: For models with many non-2D parameters or when training very large models
+
 ### Using WebDataset for training
 
 This repo now supports WebDataset shards for training. Set `config.rec` to one of:

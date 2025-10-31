@@ -9,6 +9,7 @@ from backbones import get_model
 from dataset import get_dataloader
 from losses import CombinedMarginLoss
 from lr_scheduler import PolynomialLRWarmup
+from muon import Muon
 from partial_fc_v2 import PartialFC_V2
 from torch import distributed
 from torch.utils.data import DataLoader
@@ -176,8 +177,20 @@ def main(args):
         opt = torch.optim.AdamW(
             params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}],
             lr=cfg.lr, weight_decay=cfg.weight_decay)
+    
+    elif cfg.optimizer == "muon":
+        module_partial_fc = PartialFC_V2(
+            margin_loss, cfg.embedding_size, cfg.num_classes,
+            cfg.sample_rate, False, amp=cfg.amp)
+        module_partial_fc.train().to(device)
+        # Muon optimizer with configurable parameters
+        momentum = getattr(cfg, "momentum", 0.95)
+        nesterov = getattr(cfg, "nesterov", True)
+        opt = Muon(
+            params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}],
+            lr=cfg.lr, momentum=momentum, nesterov=nesterov)
     else:
-        raise
+        raise ValueError(f"Unsupported optimizer: {cfg.optimizer}")
 
     cfg.total_batch_size = cfg.batch_size * world_size
     cfg.warmup_step = cfg.num_image // cfg.total_batch_size * cfg.warmup_epoch
