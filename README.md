@@ -41,6 +41,8 @@ torchrun --nproc_per_node=4 train_v2_restart.py configs/edgeface_xs_gamma_06_res
 
 This repository now supports the **Muon optimizer** (MomentUm Orthogonalized by Newton-schulz), a novel optimizer that combines momentum-based updates with Newton-Schulz orthogonalization.
 
+🚀 **[Quick Start Guide](docs/MUON_QUICKSTART.md)** | 📚 **[Full Documentation (EN)](docs/MUON_OPTIMIZER.md)** | 🇯🇵 **[日本語ドキュメント](docs/MUON_OPTIMIZER_JA.md)**
+
 #### What is Muon?
 
 Muon is particularly effective for training deep neural networks with 2D parameters (weight matrices). It provides:
