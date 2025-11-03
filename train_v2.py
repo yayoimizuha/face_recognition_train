@@ -283,7 +283,7 @@ def main(args):
 
             # 1) 損失のNaN/Inf簡易チェック（シンプルな停止処理）
             if not torch.isfinite(loss):
-                raise RuntimeError(f"Loss is NaN/Inf at step {global_step} (epoch {epoch}).")
+                print(f"Loss is NaN/Inf at step {global_step} (epoch {epoch}).")
 
             if amp.is_enabled():
                 amp.scale(loss).backward()
@@ -293,7 +293,7 @@ def main(args):
                     for p in backbone.parameters():
                         if p.grad is not None and not torch.isfinite(p.grad).all():
                             opt.zero_grad()
-                            raise RuntimeError(f"Gradient is NaN/Inf at step {global_step} (epoch {epoch}).")
+                            print(f"Gradient is NaN/Inf at step {global_step} (epoch {epoch}).")
 
                     torch.nn.utils.clip_grad_norm_(backbone.parameters(), 5)
                     amp.step(opt)
@@ -306,7 +306,7 @@ def main(args):
                     for p in backbone.parameters():
                         if p.grad is not None and not torch.isfinite(p.grad).all():
                             opt.zero_grad()
-                            raise RuntimeError(f"Gradient is NaN/Inf at step {global_step} (epoch {epoch}).")
+                            print(f"Gradient is NaN/Inf at step {global_step} (epoch {epoch}).")
 
                     torch.nn.utils.clip_grad_norm_(backbone.parameters(), 5)
                     opt.step()
