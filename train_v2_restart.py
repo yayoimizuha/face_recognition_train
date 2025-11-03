@@ -262,10 +262,10 @@ def main(args):
                 if global_step % cfg.gradient_acc == 0:
                     amp.unscale_(opt)
                     # 2) 勾配のNaN/Inf簡易チェック（unscale後に検査）
-                    for p in backbone.parameters():
-                        if p.grad is not None and not torch.isfinite(p.grad).all():
-                            opt.zero_grad()
-                            print(f"Gradient is NaN/Inf at step {global_step} (epoch {epoch}).")
+                    if distributed.get_rank() == 0:
+                        for p in backbone.parameters():
+                            if p.grad is not None and not torch.isfinite(p.grad).all():
+                                print(f"Gradient is NaN/Inf at step {global_step} (epoch {epoch}).")
 
                     torch.nn.utils.clip_grad_norm_(backbone.parameters(), 5)
                     amp.step(opt)
@@ -275,10 +275,10 @@ def main(args):
                 loss.backward()
                 if global_step % cfg.gradient_acc == 0:
                     # 2) 勾配のNaN/Inf簡易チェック（FP32経路）
-                    for p in backbone.parameters():
-                        if p.grad is not None and not torch.isfinite(p.grad).all():
-                            opt.zero_grad()
-                            print(f"Gradient is NaN/Inf at step {global_step} (epoch {epoch}).")
+                    if distributed.get_rank() == 0:
+                        for p in backbone.parameters():
+                            if p.grad is not None and not torch.isfinite(p.grad).all():
+                                print(f"Gradient is NaN/Inf at step {global_step} (epoch {epoch}).")
 
                     torch.nn.utils.clip_grad_norm_(backbone.parameters(), 5)
                     opt.step()

@@ -4,6 +4,7 @@ import time
 from typing import List, Optional
 
 import torch
+import math
 
 from eval import verification
 from utils.utils_logging import AverageMeter
@@ -145,10 +146,20 @@ class CallBackLogging(object):
                     self.writer.add_scalar('learning_rate', learning_rate, global_step)
                     self.writer.add_scalar('loss', loss.avg, global_step)
                 if fp16:
+                    # 表示を小数ではなく 2^n 形式に変換（近似の場合は ≈2^n を表示）
+                    scale_val = float(grad_scaler.get_scale())
+                    if scale_val > 0:
+                        n = int(round(math.log2(scale_val)))
+                        is_pow2 = abs(scale_val - (2.0 ** n)) <= max(1e-3, 1e-6 * scale_val)
+                        scale_str = f"2^{n}" if is_pow2 else f"≈2^{n}"
+                    else:
+                        # 非常に例外的なケースだが、非正の値はそのまま文字列化
+                        scale_str = str(scale_val)
+
                     msg = "Speed %.2f samples/sec   Loss %.4f   LearningRate %.6f   Epoch: %d   Global Step: %d   " \
-                          "Fp16 Grad Scale: %f   Required: %s" % (
+                          "Fp16 Grad Scale: %s   Required: %s" % (
                               speed_total, loss.avg, learning_rate, epoch, global_step,
-                              grad_scaler.get_scale(), eta_formatted
+                              scale_str, eta_formatted
                           )
                 else:
                     msg = "Speed %.2f samples/sec   Loss %.4f   LearningRate %.6f   Epoch: %d   Global Step: %d   " \
