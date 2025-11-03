@@ -146,7 +146,7 @@ class CallBackLogging(object):
                     self.writer.add_scalar('loss', loss.avg, global_step)
                 if fp16:
                     msg = "Speed %.2f samples/sec   Loss %.4f   LearningRate %.6f   Epoch: %d   Global Step: %d   " \
-                          "Fp16 Grad Scale: %2.f   Required: %s" % (
+                          "Fp16 Grad Scale: %f   Required: %s" % (
                               speed_total, loss.avg, learning_rate, epoch, global_step,
                               grad_scaler.get_scale(), eta_formatted
                           )
