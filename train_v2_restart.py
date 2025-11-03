@@ -19,6 +19,7 @@ from utils.utils_distributed_sampler import setup_seed
 from utils.utils_logging import AverageMeter, init_logging
 from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compress_hook
 from torch.amp.grad_scaler import GradScaler
+from timm.layers.norm_act import convert_sync_batchnorm
 import os
 import sys
 assert torch.__version__ >= "1.12.0", "In order to enjoy the features of the new torch, \
@@ -137,6 +138,9 @@ def main(args):
 
     backbone = get_model(
         cfg.network, dropout=0.0, amp=cfg.amp, num_features=cfg.embedding_size).to(device)
+    
+    # Convert BatchNorm layers to SyncBatchNorm for proper distributed training
+    backbone = convert_sync_batchnorm(backbone)
 
     ddp_device_ids = [local_rank] if device.type != "cpu" else None
     backbone = torch.nn.parallel.DistributedDataParallel(
