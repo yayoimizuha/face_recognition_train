@@ -19,6 +19,10 @@ config.batch_size = 128
 config.lr = 0.1
 config.verbose = 2000
 config.dali = False
+
+config.optimizer = "adamw"
+config.adam_betas = (0.9, 0.99)
+
 # DataLoader 用
 config.num_workers = 5
 # DALI 増強は無効（HF の DataLoader を使用）

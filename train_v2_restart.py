@@ -177,9 +177,10 @@ def main(args):
             margin_loss, cfg.embedding_size, cfg.num_classes,
             cfg.sample_rate, False, amp=cfg.amp)
         module_partial_fc.train().to(device)
+        betas = tuple(getattr(cfg, "adam_betas", (0.9, 0.999)))
         opt = torch.optim.AdamW(
             params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}],
-            lr=cfg.lr, weight_decay=cfg.weight_decay)
+            lr=cfg.lr, weight_decay=cfg.weight_decay, betas=betas)
     else:
         raise
 

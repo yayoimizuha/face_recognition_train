@@ -43,6 +43,8 @@ config.weight_decay = 5e-4
 # config.optimizer = "adamw"
 # config.lr = 0.001
 # config.weight_decay = 0.1
+# AdamW beta hyperparameters (Beta1, Beta2)
+config.adam_betas = (0.9, 0.999)
 
 config.verbose = 2000
 config.frequent = 10
