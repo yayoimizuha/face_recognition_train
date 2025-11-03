@@ -224,7 +224,7 @@ class DistCrossEntropyFunc(torch.autograd.Function):
         )
         one_hot.scatter_(1, label[index], 1.0)
         logits[index] -= one_hot
-        logits.div_(batch_size)
+        logits.div_(batch_size*distributed.get_world_size)
         return logits * loss_gradient.item(), None
 
 
