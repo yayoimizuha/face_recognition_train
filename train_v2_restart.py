@@ -140,7 +140,7 @@ def main(args):
         cfg.network, dropout=0.0, amp=cfg.amp, num_features=cfg.embedding_size).to(device)
     
     # Convert BatchNorm layers to SyncBatchNorm for proper distributed training
-    backbone = convert_sync_batchnorm(backbone)
+    # backbone = convert_sync_batchnorm(backbone)
 
     ddp_device_ids = [local_rank] if device.type != "cpu" else None
     backbone = torch.nn.parallel.DistributedDataParallel(
