@@ -13,15 +13,15 @@ config.device_type = "cuda"
 config.dist_backend = "nccl"  # 明示指定（"gloo"|"ccl"|"nccl"）
 # config.fp16 = True  # legacy flag; kept for backward compatibility
 config.amp = torch.bfloat16  # set torch dtype directly
-config.momentum = 0.9
-config.weight_decay = 1e-4
-config.batch_size = 1024
-config.lr = 0.1
+# config.momentum = 0.9
+config.batch_size = 256
 config.verbose = 2000
 config.dali = False
 
 config.optimizer = "adamw"
-config.adam_betas = (0.9, 0.99)
+config.adam_betas = (0.9, 0.999)
+config.lr = 0.004
+config.weight_decay = 0.1
 
 # DataLoader 用
 config.num_workers = 15

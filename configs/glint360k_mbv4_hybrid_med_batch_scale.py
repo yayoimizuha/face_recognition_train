@@ -6,7 +6,7 @@ config.margin_list = (1.0, 0.0, 0.4)
 config.network = "mobilenetv4_hybrid_medium.ix_e550_r384_in1k"
 config.resume = False
 # 出力先（None だと train_v2.py 内の os.path.join でエラーになるため明示）
-config.output = "./work_dirs/glint360k_mbv4_hybrid_med"
+config.output = "./work_dirs/glint360k_mbv4_hybrid_med_batch_scale"
 config.embedding_size = 512
 config.sample_rate = 1.0
 config.device_type = "cuda"
@@ -15,13 +15,13 @@ config.dist_backend = "nccl"  # 明示指定（"gloo"|"ccl"|"nccl"）
 config.amp = torch.bfloat16  # set torch dtype directly
 config.momentum = 0.9
 config.weight_decay = 1e-4
-config.batch_size = 1024
-config.lr = 0.1
+config.batch_size = 512
+config.lr = 0.4
 config.verbose = 2000
 config.dali = False
 
 config.optimizer = "adamw"
-config.adam_betas = (0.9, 0.99)
+config.adam_betas = (0.9, 0.999)
 
 # DataLoader 用
 config.num_workers = 15
