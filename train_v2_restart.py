@@ -140,7 +140,7 @@ def main(args):
         cfg.network, dropout=0.0, amp=cfg.amp, num_features=cfg.embedding_size).to(device)
     
     # Convert BatchNorm layers to SyncBatchNorm for proper distributed training
-    # backbone = convert_sync_batchnorm(backbone)
+    backbone = convert_sync_batchnorm(backbone)
 
     ddp_device_ids = [local_rank] if device.type != "cpu" else None
     backbone = torch.nn.parallel.DistributedDataParallel(
@@ -294,7 +294,8 @@ def main(args):
                         'Process/Epoch': epoch
                     })
                 
-                loss_am.update(loss.item(), 1)
+                if loss.item() > 0:
+                    loss_am.update(loss.item(), 1)
                 callback_logging(global_step, loss_am, epoch, amp.is_enabled(), lr_scheduler.get_last_lr()[0], amp)
 
                 if global_step % cfg.verbose == 0 and global_step > 0:

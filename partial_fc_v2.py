@@ -25,16 +25,17 @@ class PartialFC_V2(torch.nn.Module):
     >>>     loss.backward()
     >>>     optimizer.step()
     """
+
     _version = 2
 
     def __init__(
-            self,
-            margin_loss: Callable,
-            embedding_size: int,
-            num_classes: int,
-            sample_rate: float = 1.0,
-            fp16: bool = False,
-            amp: torch.dtype = torch.float16,
+        self,
+        margin_loss: Callable,
+        embedding_size: int,
+        num_classes: int,
+        sample_rate: float = 1.0,
+        fp16: bool = False,
+        amp: torch.dtype = torch.float16,
     ):
         """
         Paramenters:
@@ -47,9 +48,7 @@ class PartialFC_V2(torch.nn.Module):
             The rate of negative centers participating in the calculation, default is 1.0.
         """
         super(PartialFC_V2, self).__init__()
-        assert (
-            distributed.is_initialized()
-        ), "must initialize distributed before create this"
+        assert distributed.is_initialized(), "must initialize distributed before create this"
         self.rank = distributed.get_rank()
         self.world_size = distributed.get_world_size()
 
@@ -58,12 +57,8 @@ class PartialFC_V2(torch.nn.Module):
         self.sample_rate: float = sample_rate
         self.fp16 = fp16
         self.amp_dtype = amp
-        self.num_local: int = num_classes // self.world_size + int(
-            self.rank < num_classes % self.world_size
-        )
-        self.class_start: int = num_classes // self.world_size * self.rank + min(
-            self.rank, num_classes % self.world_size
-        )
+        self.num_local: int = num_classes // self.world_size + int(self.rank < num_classes % self.world_size)
+        self.class_start: int = num_classes // self.world_size * self.rank + min(self.rank, num_classes % self.world_size)
         self.num_sample: int = int(self.sample_rate * self.num_local)
         self.last_batch_size: int = 0
 
@@ -79,15 +74,15 @@ class PartialFC_V2(torch.nn.Module):
 
     def sample(self, labels, index_positive):
         """
-            This functions will change the value of labels
-            Parameters:
-            -----------
-            labels: torch.Tensor
-                pass
-            index_positive: torch.Tensor
-                pass
-            optimizer: torch.optim.Optimizer
-                pass
+        This functions will change the value of labels
+        Parameters:
+        -----------
+        labels: torch.Tensor
+            pass
+        index_positive: torch.Tensor
+            pass
+        optimizer: torch.optim.Optimizer
+            pass
         """
         with torch.no_grad():
             device = labels.device
@@ -106,9 +101,9 @@ class PartialFC_V2(torch.nn.Module):
         return self.weight[self.weight_index]
 
     def forward(
-            self,
-            local_embeddings: torch.Tensor,
-            local_labels: torch.Tensor,
+        self,
+        local_embeddings: torch.Tensor,
+        local_labels: torch.Tensor,
     ):
         """
         Parameters:
@@ -128,18 +123,12 @@ class PartialFC_V2(torch.nn.Module):
         batch_size = local_embeddings.size(0)
         if self.last_batch_size == 0:
             self.last_batch_size = batch_size
-        assert self.last_batch_size == batch_size, (
-            f"last batch size do not equal current batch size: {self.last_batch_size} vs {batch_size}")
+        assert self.last_batch_size == batch_size, f"last batch size do not equal current batch size: {self.last_batch_size} vs {batch_size}"
 
         emb_device = local_embeddings.device
         lbl_device = local_labels.device
-        _gather_embeddings = [
-            torch.zeros((batch_size, self.embedding_size), device=emb_device)
-            for _ in range(self.world_size)
-        ]
-        _gather_labels = [
-            torch.zeros(batch_size, dtype=torch.long, device=lbl_device) for _ in range(self.world_size)
-        ]
+        _gather_embeddings = [torch.zeros((batch_size, self.embedding_size), device=emb_device) for _ in range(self.world_size)]
+        _gather_labels = [torch.zeros(batch_size, dtype=torch.long, device=lbl_device) for _ in range(self.world_size)]
         _list_embeddings = AllGather(local_embeddings, *_gather_embeddings)
         distributed.all_gather(_gather_labels, local_labels)
 
@@ -147,9 +136,7 @@ class PartialFC_V2(torch.nn.Module):
         labels = torch.cat(_gather_labels)
 
         labels = labels.view(-1, 1)
-        index_positive = (self.class_start <= labels) & (
-                labels < self.class_start + self.num_local
-        )
+        index_positive = (self.class_start <= labels) & (labels < self.class_start + self.num_local)
         labels[~index_positive] = -1
         labels[index_positive] -= self.class_start
 
@@ -219,12 +206,10 @@ class DistCrossEntropyFunc(torch.autograd.Function):
         ) = ctx.saved_tensors
         batch_size = logits.size(0)
         # keep one_hot dtype consistent with logits for safe in-place ops and gradient dtype
-        one_hot = torch.zeros(
-            size=[index.size(0), logits.size(1)], device=logits.device, dtype=logits.dtype
-        )
+        one_hot = torch.zeros(size=[index.size(0), logits.size(1)], device=logits.device, dtype=logits.dtype)
         one_hot.scatter_(1, label[index], 1.0)
         logits[index] -= one_hot
-        logits.div_(batch_size*distributed.get_world_size())
+        logits.div_(batch_size * distributed.get_world_size())
         return logits * loss_gradient.item(), None
 
 
