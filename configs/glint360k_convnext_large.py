@@ -3,25 +3,25 @@ import torch
 
 config = edict()
 config.margin_list = (1.0, 0.0, 0.4)
-config.network = "mobilenetv4_hybrid_medium.ix_e550_r384_in1k"
+config.network = "convnext_large_mlp.clip_laion2b_soup_ft_in12k_in1k_320"
 config.resume = False
 # 出力先（None だと train_v2.py 内の os.path.join でエラーになるため明示）
-config.output = "./work_dirs/glint360k_mbv4_hybrid_med_sgd"
+config.output = "./work_dirs/glint360k_convnext_large"
 config.embedding_size = 512
 config.sample_rate = 1.0
 config.device_type = "cuda"
 config.dist_backend = "nccl"  # 明示指定（"gloo"|"ccl"|"nccl"）
 # config.fp16 = True  # legacy flag; kept for backward compatibility
 config.amp = torch.bfloat16  # set torch dtype directly
-config.momentum = 0.9
-config.weight_decay = 1e-4
+# config.momentum = 0.9
 config.batch_size = 128
-config.lr = 0.1
 config.verbose = 2000
 config.dali = False
 
-# config.optimizer = "adamw"
-# config.adam_betas = (0.9, 0.999)
+config.optimizer = "adamw"
+config.adam_betas = (0.9, 0.999)
+config.lr = 0.001
+config.weight_decay = 0.1
 
 # DataLoader 用
 config.num_workers = 15

@@ -6,7 +6,7 @@ config.margin_list = (1.0, 0.0, 0.4)
 config.network = "mobilenetv4_hybrid_medium.ix_e550_r384_in1k"
 config.resume = False
 # 出力先（None だと train_v2.py 内の os.path.join でエラーになるため明示）
-config.output = "./work_dirs/glint360k_mbv4_hybrid_med"
+config.output = "./work_dirs/glint360k_mbv4_hybrid_med_back"
 config.embedding_size = 512
 config.sample_rate = 1.0
 config.device_type = "cuda"
