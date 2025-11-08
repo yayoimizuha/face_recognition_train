@@ -32,6 +32,13 @@ dependencies = [
 #    "intel-extension-for-pytorch"
 ]
 
+[project.optional-dependencies]
+tpu = [
+    "torch_xla~=2.8",
+    "torch~=2.8",
+    "torchvision~=0.23",
+]
+
 [[tool.uv.index]]
 name = "torch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
@@ -63,9 +70,15 @@ name = "ipex"
 url = "https://pytorch-extension.intel.com/release-whl/stable/cpu/us/"
 explicit = true
 
+[[tool.uv.index]]
+name = "pytorch-xla"
+url = "https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch_xla-2.8.0-cp312-cp312-linux_x86_64.whl"
+explicit = true
+
 [tool.uv.sources]
 torch = [{ index = "torch-cu129" }]
 torchvision = [{ index = "torch-cu129" }]
 nvidia-dali-cuda120 = [{ index = "pypi-nvidia" }]
 intel-extension-for-pytorch = [{ index = "ipex" }]
+torch_xla = [{ index = "pytorch-xla" }]
 

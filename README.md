@@ -37,6 +37,16 @@ After finishing this step, launch:
 torchrun --nproc_per_node=4 train_v2_restart.py configs/edgeface_xs_gamma_06_restart.py
 ```
 
+#### Training on Google Cloud TPU v5e-8
+
+For training on TPU, use the TPU-specific script and configuration:
+
+```bash
+./run_tpu.sh configs/edgeface_s_gamma_05_tpu.py
+```
+
+See [docs/TPU_TRAINING.md](docs/TPU_TRAINING.md) for detailed instructions on TPU training setup, configuration, and optimization.
+
 ### Using WebDataset for training
 
 This repo now supports WebDataset shards for training. Set `config.rec` to one of:
@@ -75,6 +85,7 @@ This repository expects you to set `config.amp` to a torch dtype directly (e.g.,
 | NVIDIA CUDA GPU | Supported (fp16, bf16) | Supported | bf16 or fp16 (depends on HW/model) | Use the dtype that matches your GPU capability and model stability. |
 | AMD ROCm GPU | Supported | Supported | bf16 (RDNA3+) or fp16 | bf16 availability may depend on ROCm version and hardware. |
 | Intel GPU (XPU / oneAPI) | Supported | Supported | bf16 | Ensure oneAPI/XPU stack is properly set up. |
+| Google Cloud TPU | Supported (bf16) | N/A (XLA handles scaling) | bf16 | Native bfloat16 support. Use `train_v2_tpu.py` for TPU training. |
 | CPU | Enabled (not disabled in this repo) | Enabled (torch.amp) | bf16 (if ISA supports), otherwise per-environment | No fallback is implemented; specifying an unsupported dtype will raise an error. |
 
 Quick usage
