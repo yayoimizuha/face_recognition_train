@@ -1,0 +1,38 @@
+# Requirements for TPU v5e-8 Training
+# Install with: pip install -r requirements-tpu.txt
+
+# PyTorch and torchvision (compatible with PyTorch/XLA 2.8)
+torch~=2.8.0
+torchvision~=0.23.0
+
+# PyTorch/XLA for TPU support
+# Install from wheel for TPU VM (Python 3.12)
+# torch_xla @ https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch_xla-2.8.0-cp312-cp312-linux_x86_64.whl
+
+# Core dependencies
+numpy~=2.3
+Pillow~=11.3
+tqdm~=4.67
+scikit-learn~=1.7
+scikit-image~=0.25
+pandas~=2.3
+opencv-python~=4.11
+
+# Model and training utilities
+timm~=1.0
+easydict~=1.13
+
+# Monitoring and logging
+tensorboard~=2.20
+wandb~=0.22
+python-dotenv~=1.1
+
+# Dataset handling
+webdataset~=1.0
+datasets~=4.1
+transformers~=4.57
+
+# Additional utilities
+prettytable~=3.16
+
+# Note: DALI, ONNX Runtime GPU, and Intel extensions are not needed for TPU training

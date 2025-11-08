@@ -2,6 +2,8 @@
 
 This guide explains how to train face recognition models on Google Cloud TPU v5e-8 using PyTorch/XLA.
 
+> **Quick Start**: See [TPU_QUICKSTART.md](TPU_QUICKSTART.md) for a condensed reference guide.
+
 ## Prerequisites
 
 1. **Google Cloud TPU VM**: You need access to a TPU v5e-8 VM instance
@@ -17,22 +19,36 @@ This guide explains how to train face recognition models on Google Cloud TPU v5e
 
 ## Installation
 
-### 1. Set up the repository
+### Quick Installation (Recommended)
 
 ```bash
 # Clone the repository
 git clone https://github.com/yayoimizuha/face_recognition_train.git
 cd face_recognition_train
 
-# Install dependencies using uv
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv sync -U
-
-# Install TPU-specific dependencies
-uv sync --extra tpu
+# Run the automated setup script
+./setup_tpu.sh
 ```
 
-### 2. Install PyTorch/XLA for TPU
+### Manual Installation
+
+#### 1. Set up the repository
+
+```bash
+# Clone the repository
+git clone https://github.com/yayoimizuha/face_recognition_train.git
+cd face_recognition_train
+
+# Install dependencies using uv (preferred)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync -U
+uv sync --extra tpu
+
+# OR install using pip
+pip install -r requirements-tpu.txt
+```
+
+#### 2. Install PyTorch/XLA for TPU
 
 ```bash
 pip install torch~=2.8.0 torchvision~=0.23.0
