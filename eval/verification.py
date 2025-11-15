@@ -80,8 +80,8 @@ def calculate_roc(thresholds, embeddings1, embeddings2, actual_issame, nrof_fold
             pca_model.fit(_embed_train)
             embed1 = pca_model.transform(embeddings1)
             embed2 = pca_model.transform(embeddings2)
-            embed1 = sklearn.preprocessing.normalize(embed1)
-            embed2 = sklearn.preprocessing.normalize(embed2)
+            embed1 = sklearn.preprocessing.normalize(embed1) # type: ignore
+            embed2 = sklearn.preprocessing.normalize(embed2) # type: ignore
             diff = np.subtract(embed1, embed2)
             dist = np.sum(np.square(diff), 1)
 
@@ -279,7 +279,7 @@ def test(data_set, backbone, batch_size, nfolds=10):
         start_idx = 0
         t_flip0 = datetime.datetime.now()
         while start_idx < total:
-            end_idx = min(start_idx + batch_size * 4, total)
+            end_idx = min(start_idx + batch_size, total)
             # 既にGPU上にあり正規化済みのテンソルをスライス
             imgs = data_gpu[start_idx:end_idx]
 

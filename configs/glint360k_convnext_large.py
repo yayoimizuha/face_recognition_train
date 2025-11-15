@@ -20,7 +20,7 @@ config.dali = False
 
 config.optimizer = "adamw"
 config.adam_betas = (0.9, 0.999)
-config.lr = 0.001
+config.lr = 0.002
 config.weight_decay = 0.1
 
 # DataLoader 用
@@ -28,12 +28,10 @@ config.num_workers = 15
 # DALI 増強は無効（HF の DataLoader を使用）
 config.dali_aug = False
 config.dataset_type = "webdataset"
-config.rec = "/home/apacsc14/Glint360k"
 
 # Glint360k のクラス数と画像枚数（スケジューラ計算用）
 config.num_classes = 360232
 config.num_image = 17091657
-config.num_epoch = 50
-config.warmup_epoch = 4
+config.num_epoch = 10
+config.warmup_epoch = 1
 config.val_targets = ['lfw', 'cfp_fp', "agedb_30"]
-config.val_dir = "/home/apacsc14/face_valid"
