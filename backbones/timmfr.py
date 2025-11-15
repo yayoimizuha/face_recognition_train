@@ -72,7 +72,8 @@ class TimmFRWrapperV2(nn.Module):
         self.featdim = num_features
         self.model_name = model_name
         self.amp_dtype = amp
-
+        if "untrained" in  self.model_name:
+            pretrained = False            
         self.model = timm.create_model(self.model_name, pretrained=pretrained, drop_rate=dropout)
         self.model.reset_classifier(self.featdim) #type: ignore
 
@@ -162,6 +163,8 @@ class TimmFRWithGDHead(nn.Module):
         self.amp_dtype = amp
         self.batchnorm = batchnorm
         # Create a timm model as a pure feature extractor (no classifier/global pool)
+        if "untrained" in  self.model_name:
+            pretrained = False  
         self.model = timm.create_model(self.model_name, pretrained=pretrained, num_classes=0, global_pool='', drop_rate=dropout)
         # Build GDConv head immediately based on a dummy 112x112 input
         self.head: nn.Module | None = None
