@@ -8,7 +8,7 @@ import torch
 from backbones import get_model
 from dataset import get_dataloader
 from losses import CombinedMarginLoss
-from lr_scheduler import PolynomialLRWarmup
+from lr_scheduler import PolynomialLRWarmup, DummyScheduler
 from partial_fc_v2 import PartialFC_V2
 from torch import distributed
 from torch.utils.data import DataLoader
@@ -203,7 +203,7 @@ def main(args):
 
     # RAdamScheduleFree doesn't need a separate learning rate scheduler
     if cfg.optimizer == "radam_schedulefree":
-        lr_scheduler = None
+        lr_scheduler = DummyScheduler(optimizer=opt)
         opt.train()  # Initialize optimizer in train mode
     else:
         lr_scheduler = PolynomialLRWarmup(
@@ -224,11 +224,10 @@ def main(args):
             opt.load_state_dict(dict_checkpoint["state_optimizer"])
         except Exception:
             logging.warning("state_optimizer not found or incompatible; continuing without optimizer state")
-        if lr_scheduler is not None:
-            try:
-                lr_scheduler.load_state_dict(dict_checkpoint["state_lr_scheduler"])
-            except Exception:
-                logging.warning("state_lr_scheduler not found or incompatible; continuing without scheduler state")
+        try:
+            lr_scheduler.load_state_dict(dict_checkpoint.get("state_lr_scheduler", {}))
+        except Exception:
+            logging.warning("state_lr_scheduler not found or incompatible; continuing without scheduler state")
         del dict_checkpoint
 
     for key, value in cfg.items():
@@ -302,8 +301,7 @@ def main(args):
                     torch.nn.utils.clip_grad_norm_(backbone.parameters(), 5)
                     opt.step()
                     opt.zero_grad()
-            if lr_scheduler is not None:
-                lr_scheduler.step()
+            lr_scheduler.step()
 
             with torch.no_grad():
                 if wandb_logger:
@@ -316,9 +314,7 @@ def main(args):
                 
                 if loss.item() > 0:
                     loss_am.update(loss.item(), 1)
-                # Get learning rate for logging
-                current_lr = lr_scheduler.get_last_lr()[0] if lr_scheduler is not None else cfg.lr
-                callback_logging(global_step, loss_am, epoch, amp.is_enabled(), current_lr, amp)
+                callback_logging(global_step, loss_am, epoch, amp.is_enabled(), lr_scheduler.get_last_lr()[0], amp)
 
                 if global_step % cfg.verbose == 0 and global_step > 0:
                     # Put optimizer in eval mode for verification when using RAdamScheduleFree
@@ -340,10 +336,8 @@ def main(args):
                 "state_dict_backbone": backbone.module.state_dict(),
                 "state_dict_softmax_fc": module_partial_fc.state_dict(),
                 "state_optimizer": opt.state_dict(),
+                "state_lr_scheduler": lr_scheduler.state_dict(),
             }
-            if lr_scheduler is not None:
-                checkpoint["state_lr_scheduler"] = lr_scheduler.state_dict()
-            
             torch.save(checkpoint, os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
             
             # Put optimizer back in train mode
