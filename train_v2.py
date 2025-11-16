@@ -8,7 +8,7 @@ import torch
 from backbones import get_model
 from dataset import get_dataloader
 from losses import CombinedMarginLoss
-from lr_scheduler import PolynomialLRWarmup
+from lr_scheduler import PolynomialLRWarmup, DummyScheduler
 from partial_fc_v2 import PartialFC_V2
 from torch import distributed
 from torch.utils.data import DataLoader
@@ -20,6 +20,7 @@ from utils.utils_logging import AverageMeter, init_logging
 from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compress_hook
 from torch.amp.grad_scaler import GradScaler
 from timm.layers.norm_act import convert_sync_batchnorm
+from schedulefree import RAdamScheduleFree
 import os
 import sys
 
@@ -208,6 +209,16 @@ def main(args):
         opt = torch.optim.AdamW(
             params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}], lr=cfg.lr, weight_decay=cfg.weight_decay, betas=betas
         )
+    elif cfg.optimizer == "radam_schedulefree":
+        module_partial_fc = PartialFC_V2(margin_loss, cfg.embedding_size, cfg.num_classes, cfg.sample_rate, False, amp=cfg.amp)
+        module_partial_fc.train().to(device)
+        betas = tuple(getattr(cfg, "adam_betas", (0.9, 0.999)))
+        opt = RAdamScheduleFree(
+            params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}], 
+            lr=cfg.lr, 
+            betas=betas,
+            weight_decay=cfg.weight_decay
+        )
     else:
         raise
 
@@ -215,7 +226,12 @@ def main(args):
     cfg.warmup_step = cfg.num_image // cfg.total_batch_size * cfg.warmup_epoch
     cfg.total_step = cfg.num_image // cfg.total_batch_size * cfg.num_epoch
 
-    lr_scheduler = PolynomialLRWarmup(optimizer=opt, warmup_iters=cfg.warmup_step, total_iters=cfg.total_step)
+    # RAdamScheduleFree doesn't need a separate learning rate scheduler
+    if cfg.optimizer == "radam_schedulefree":
+        lr_scheduler = DummyScheduler(optimizer=opt)
+        opt.train()  # Initialize optimizer in train mode
+    else:
+        lr_scheduler = PolynomialLRWarmup(optimizer=opt, warmup_iters=cfg.warmup_step, total_iters=cfg.total_step)
 
     start_epoch = 0
     global_step = 0
@@ -226,7 +242,7 @@ def main(args):
         backbone.module.load_state_dict(dict_checkpoint["state_dict_backbone"])
         module_partial_fc.load_state_dict(dict_checkpoint["state_dict_softmax_fc"])
         opt.load_state_dict(dict_checkpoint["state_optimizer"])
-        lr_scheduler.load_state_dict(dict_checkpoint["state_lr_scheduler"])
+        lr_scheduler.load_state_dict(dict_checkpoint.get("state_lr_scheduler", {}))
         del dict_checkpoint
 
     for key, value in cfg.items():
@@ -304,9 +320,19 @@ def main(args):
                 callback_logging(global_step, loss_am, epoch, amp.is_enabled(), lr_scheduler.get_last_lr()[0], amp)
 
                 if global_step % cfg.verbose == 0 and global_step > 0:
+                    # Put optimizer in eval mode for verification when using RAdamScheduleFree
+                    if cfg.optimizer == "radam_schedulefree":
+                        opt.eval()
                     callback_verification(global_step, backbone)
+                    # Put optimizer back in train mode
+                    if cfg.optimizer == "radam_schedulefree":
+                        opt.train()
 
         if cfg.save_all_states:
+            # Put optimizer in eval mode for checkpoint saving when using RAdamScheduleFree
+            if cfg.optimizer == "radam_schedulefree":
+                opt.eval()
+            
             checkpoint = {
                 "epoch": epoch + 1,
                 "global_step": global_step,
@@ -316,6 +342,10 @@ def main(args):
                 "state_lr_scheduler": lr_scheduler.state_dict(),
             }
             torch.save(checkpoint, os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
+            
+            # Put optimizer back in train mode
+            if cfg.optimizer == "radam_schedulefree":
+                opt.train()
 
         if rank == 0:
             path_module = os.path.join(cfg.output, f"model_{epoch}.pt")

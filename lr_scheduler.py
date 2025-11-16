@@ -3,6 +3,32 @@ from torch.optim import SGD
 import torch
 import warnings
 
+
+class DummyScheduler:
+    """
+    Dummy scheduler that does nothing. Used for schedule-free optimizers.
+    Implements the same interface as _LRScheduler but performs no operations.
+    """
+    def __init__(self, optimizer, **kwargs):
+        self.optimizer = optimizer
+    
+    def step(self):
+        """No-op step function"""
+        pass
+    
+    def get_last_lr(self):
+        """Returns current learning rates from optimizer"""
+        return [group['lr'] for group in self.optimizer.param_groups]
+    
+    def state_dict(self):
+        """Returns empty state dict"""
+        return {}
+    
+    def load_state_dict(self, state_dict):
+        """No-op load function"""
+        pass
+
+
 class PolynomialLRWarmup(_LRScheduler):
     def __init__(self, optimizer, warmup_iters, total_iters=5, power=1.0, last_epoch=-1):
         super().__init__(optimizer, last_epoch=last_epoch)
