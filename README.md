@@ -53,6 +53,47 @@ Example config snippet:
 config.rec = "/data/webdataset/shards/{000000..000127}.tar"
 ```
 
+## Optimizer Options
+
+This repository supports multiple optimizers. You can select an optimizer by setting `config.optimizer` in your configuration file:
+
+### SGD (Stochastic Gradient Descent)
+```python
+config.optimizer = "sgd"
+config.lr = 0.1
+config.momentum = 0.9
+config.weight_decay = 5e-4
+```
+
+### AdamW
+```python
+config.optimizer = "adamw"
+config.lr = 0.001
+config.weight_decay = 0.1
+config.adam_betas = (0.9, 0.999)
+```
+
+### LAMB (Layer-wise Adaptive Moments optimizer for Batch training)
+LAMB is designed for efficient large batch training, making it ideal for training small models with very large batch sizes.
+
+```python
+config.optimizer = "lamb"
+config.lr = 6e-3
+config.weight_decay = 0.05
+config.adam_betas = (0.9, 0.999)
+config.batch_size = 2048  # Large batch sizes work well with LAMB
+```
+
+### RAdamScheduleFree
+Schedule-free RAdam optimizer that doesn't require a separate learning rate scheduler.
+
+```python
+config.optimizer = "radam_schedulefree"
+config.lr = 0.001
+config.weight_decay = 0.1
+config.adam_betas = (0.9, 0.999)
+```
+
 
 # EdgeFace Models via `torch.hub`
 

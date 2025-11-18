@@ -21,6 +21,7 @@ from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compr
 from torch.amp.grad_scaler import GradScaler
 from timm.layers.norm_act import convert_sync_batchnorm
 from schedulefree import RAdamScheduleFree
+from torch_optimizer import Lamb
 import os
 import sys
 assert torch.__version__ >= "1.12.0", "In order to enjoy the features of the new torch, \
@@ -191,6 +192,18 @@ def main(args):
         opt = RAdamScheduleFree(
             params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}], 
             lr=cfg.lr, 
+            betas=betas,
+            weight_decay=cfg.weight_decay
+        )
+    elif cfg.optimizer == "lamb":
+        module_partial_fc = PartialFC_V2(
+            margin_loss, cfg.embedding_size, cfg.num_classes,
+            cfg.sample_rate, False, amp=cfg.amp)
+        module_partial_fc.train().to(device)
+        betas = tuple(getattr(cfg, "adam_betas", (0.9, 0.999)))
+        opt = Lamb(
+            params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}],
+            lr=cfg.lr,
             betas=betas,
             weight_decay=cfg.weight_decay
         )
