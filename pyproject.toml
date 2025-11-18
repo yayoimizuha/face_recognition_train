@@ -30,6 +30,7 @@ dependencies = [
     "transformers~=4.57",
     "mkl~=2025.2",
     "schedulefree~=1.4",
+    "pytorch-lamb~=1.0",
 #    "intel-extension-for-pytorch"
 ]
 
