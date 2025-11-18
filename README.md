@@ -84,11 +84,6 @@ config.adam_betas = (0.9, 0.999)
 config.batch_size = 2048  # Large batch sizes work well with LAMB
 ```
 
-**Example usage:**
-```bash
-torchrun --nproc_per_node=8 train_v2.py configs/edgeface_s_lamb_test.py
-```
-
 ### RAdamScheduleFree
 Schedule-free RAdam optimizer that doesn't require a separate learning rate scheduler.
 
