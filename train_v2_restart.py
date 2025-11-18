@@ -21,7 +21,7 @@ from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compr
 from torch.amp.grad_scaler import GradScaler
 from timm.layers.norm_act import convert_sync_batchnorm
 from schedulefree import RAdamScheduleFree
-from pytorch_lamb import Lamb
+from torch_optimizer import Lamb
 import os
 import sys
 assert torch.__version__ >= "1.12.0", "In order to enjoy the features of the new torch, \
