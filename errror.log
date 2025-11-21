@@ -1,0 +1,173 @@
+Training: 2025-11-16 18:49:24,385-Speed 8084.37 samples/sec   Loss 2.4022   LearningRate 0.000085   Epoch: 24   Global Step: 204540   Fp16 Grad Scale: 2^13   Required: 18min,22sec
+Training: 2025-11-16 18:49:26,920-Speed 8082.85 samples/sec   Loss 2.3227   LearningRate 0.000085   Epoch: 24   Global Step: 204550   Fp16 Grad Scale: 2^13   Required: 18min,19sec
+[rank1]:[E1116 18:59:26.211307492 ProcessGroupNCCL.cpp:683] [Rank 1] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=32114355, OpType=_ALLGATHER_BASE, NumelIn=65, NumelOut=260, Timeout(ms)=600000) ran for 600008 milliseconds before timing out.
+[rank1]:[E1116 18:59:26.211733418 ProcessGroupNCCL.cpp:2241] [PG ID 0 PG GUID 0(default_pg) Rank 1]  failure detected by watchdog at work sequence id: 32114355 PG status: last enqueued work: 32114355, last completed work: 32114354
+[rank1]:[E1116 18:59:26.211765779 ProcessGroupNCCL.cpp:730] Stack trace of the failed collective not found, potentially because FlightRecorder is disabled. You can enable it by setting TORCH_NCCL_TRACE_BUFFER_SIZE to a non-zero value.
+[rank1]:[E1116 18:59:26.211900155 ProcessGroupNCCL.cpp:2573] [PG ID 0 PG GUID 0(default_pg) Rank 1] First PG on this rank to signal dumping.
+[rank0]:[E1116 18:59:26.266723151 ProcessGroupNCCL.cpp:683] [Rank 0] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=32114355, OpType=_ALLGATHER_BASE, NumelIn=65, NumelOut=260, Timeout(ms)=600000) ran for 600035 milliseconds before timing out.
+[rank0]:[E1116 18:59:26.267536650 ProcessGroupNCCL.cpp:2241] [PG ID 0 PG GUID 0(default_pg) Rank 0]  failure detected by watchdog at work sequence id: 32114355 PG status: last enqueued work: 32114355, last completed work: 32114354
+[rank0]:[E1116 18:59:26.267561910 ProcessGroupNCCL.cpp:730] Stack trace of the failed collective not found, potentially because FlightRecorder is disabled. You can enable it by setting TORCH_NCCL_TRACE_BUFFER_SIZE to a non-zero value.
+[rank0]:[E1116 18:59:26.267645370 ProcessGroupNCCL.cpp:2573] [PG ID 0 PG GUID 0(default_pg) Rank 0] First PG on this rank to signal dumping.
+[rank2]:[E1116 18:59:26.297663786 ProcessGroupNCCL.cpp:683] [Rank 2] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=32114355, OpType=_ALLGATHER_BASE, NumelIn=65, NumelOut=260, Timeout(ms)=600000) ran for 600093 milliseconds before timing out.
+[rank2]:[E1116 18:59:26.298308977 ProcessGroupNCCL.cpp:2241] [PG ID 0 PG GUID 0(default_pg) Rank 2]  failure detected by watchdog at work sequence id: 32114355 PG status: last enqueued work: 32114355, last completed work: 32114354
+[rank2]:[E1116 18:59:26.298344319 ProcessGroupNCCL.cpp:730] Stack trace of the failed collective not found, potentially because FlightRecorder is disabled. You can enable it by setting TORCH_NCCL_TRACE_BUFFER_SIZE to a non-zero value.
+[rank2]:[E1116 18:59:26.298469756 ProcessGroupNCCL.cpp:2573] [PG ID 0 PG GUID 0(default_pg) Rank 2] First PG on this rank to signal dumping.
+[rank2]:[E1116 18:59:27.799035768 ProcessGroupNCCL.cpp:1858] [PG ID 0 PG GUID 0(default_pg) Rank 2] Received a dump signal due to a collective timeout from this local rank and we will try our best to dump the debug info. Last enqueued NCCL work: 32114355, last completed NCCL work: 32114354.T
+his is most likely caused by incorrect usages of collectives, e.g., wrong sizes used across ranks, the order of collectives is not same for all ranks or the scheduled collective, for some reason, didn't run. Additionally, this can be caused by GIL deadlock or other reasons such as network er
+rors or bugs in the communications library (e.g. NCCL), etc.
+[rank2]:[E1116 18:59:27.799533815 ProcessGroupNCCL.cpp:1575] [PG ID 0 PG GUID 0(default_pg) Rank 2] ProcessGroupNCCL preparing to dump debug info. Include stack trace: 1
+[rank0]:[E1116 18:59:27.978510719 ProcessGroupNCCL.cpp:1858] [PG ID 0 PG GUID 0(default_pg) Rank 0] Received a dump signal due to a collective timeout from this local rank and we will try our best to dump the debug info. Last enqueued NCCL work: 32114355, last completed NCCL work: 32114354.T
+his is most likely caused by incorrect usages of collectives, e.g., wrong sizes used across ranks, the order of collectives is not same for all ranks or the scheduled collective, for some reason, didn't run. Additionally, this can be caused by GIL deadlock or other reasons such as network er
+rors or bugs in the communications library (e.g. NCCL), etc.
+[rank0]:[E1116 18:59:27.979110326 ProcessGroupNCCL.cpp:1575] [PG ID 0 PG GUID 0(default_pg) Rank 0] ProcessGroupNCCL preparing to dump debug info. Include stack trace: 1
+[rank1]:[E1116 18:59:27.092307230 ProcessGroupNCCL.cpp:1858] [PG ID 0 PG GUID 0(default_pg) Rank 1] Received a dump signal due to a collective timeout from this local rank and we will try our best to dump the debug info. Last enqueued NCCL work: 32114355, last completed NCCL work: 32114354.T
+his is most likely caused by incorrect usages of collectives, e.g., wrong sizes used across ranks, the order of collectives is not same for all ranks or the scheduled collective, for some reason, didn't run. Additionally, this can be caused by GIL deadlock or other reasons such as network er
+rors or bugs in the communications library (e.g. NCCL), etc.
+[rank1]:[E1116 18:59:27.092892699 ProcessGroupNCCL.cpp:1575] [PG ID 0 PG GUID 0(default_pg) Rank 1] ProcessGroupNCCL preparing to dump debug info. Include stack trace: 1
+[rank1]:[E1116 19:00:27.507970260 ProcessGroupNCCL.cpp:744] [Rank 1] Some NCCL operations have failed or timed out. Due to the asynchronous nature of CUDA kernels, subsequent GPU operations might run on corrupted/incomplete data.
+[rank1]:[E1116 19:00:27.508027533 ProcessGroupNCCL.cpp:758] [Rank 1] To avoid data inconsistency, we are taking the entire process down.
+[rank1]:[E1116 19:00:27.512135784 ProcessGroupNCCL.cpp:2057] [PG ID 0 PG GUID 0(default_pg) Rank 1] Process group watchdog thread terminated with exception: [Rank 1] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=32114355, OpType=_ALLGATHER_BASE, NumelIn=65, NumelOut=260, Time
+out(ms)=600000) ran for 600008 milliseconds before timing out.
+Exception raised from checkTimeout at /pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:686 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x74c9def77b80 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: c10d::ProcessGroupNCCL::WorkNCCL::checkTimeout(std::optional<std::chrono::duration<long, std::ratio<1l, 1000l> > >) + 0x247 (0x74c96508d9d7 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: c10d::ProcessGroupNCCL::Watchdog::runLoop() + 0x1691 (0x74c9650925e1 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: c10d::ProcessGroupNCCL::Watchdog::run() + 0xdf (0x74c96509382f in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #4: <unknown function> + 0xecdb4 (0x74c9ee4ecdb4 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #5: <unknown function> + 0x9caa4 (0x74c9f109caa4 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #6: <unknown function> + 0x129c6c (0x74c9f1129c6c in /lib/x86_64-linux-gnu/libc.so.6)
+
+terminate called after throwing an instance of 'c10::DistBackendError'
+  what():  [PG ID 0 PG GUID 0(default_pg) Rank 1] Process group watchdog thread terminated with exception: [Rank 1] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=32114355, OpType=_ALLGATHER_BASE, NumelIn=65, NumelOut=260, Timeout(ms)=600000) ran for 600008 milliseconds before
+ timing out.
+Exception raised from checkTimeout at /pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:686 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x74c9def77b80 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: c10d::ProcessGroupNCCL::WorkNCCL::checkTimeout(std::optional<std::chrono::duration<long, std::ratio<1l, 1000l> > >) + 0x247 (0x74c96508d9d7 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: c10d::ProcessGroupNCCL::Watchdog::runLoop() + 0x1691 (0x74c9650925e1 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: c10d::ProcessGroupNCCL::Watchdog::run() + 0xdf (0x74c96509382f in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #4: <unknown function> + 0xecdb4 (0x74c9ee4ecdb4 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #5: <unknown function> + 0x9caa4 (0x74c9f109caa4 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #6: <unknown function> + 0x129c6c (0x74c9f1129c6c in /lib/x86_64-linux-gnu/libc.so.6)
+
+terminate called after throwing an instance of 'c10::DistBackendError'
+  what():  [PG ID 0 PG GUID 0(default_pg) Rank 1] Process group watchdog thread terminated with exception: [Rank 1] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=32114355, OpType=_ALLGATHER_BASE, NumelIn=65, NumelOut=260, Timeout(ms)=600000) ran for 600008 milliseconds before
+ timing out.
+Exception raised from checkTimeout at /pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:686 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x74c9def77b80 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: c10d::ProcessGroupNCCL::WorkNCCL::checkTimeout(std::optional<std::chrono::duration<long, std::ratio<1l, 1000l> > >) + 0x247 (0x74c96508d9d7 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: c10d::ProcessGroupNCCL::Watchdog::runLoop() + 0x1691 (0x74c9650925e1 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: c10d::ProcessGroupNCCL::Watchdog::run() + 0xdf (0x74c96509382f in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #4: <unknown function> + 0xecdb4 (0x74c9ee4ecdb4 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #5: <unknown function> + 0x9caa4 (0x74c9f109caa4 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #6: <unknown function> + 0x129c6c (0x74c9f1129c6c in /lib/x86_64-linux-gnu/libc.so.6)
+
+Exception raised from run at /pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:2063 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x74c9def77b80 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0xe69b51 (0x74c965069b51 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: <unknown function> + 0x951271 (0x74c964b51271 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: <unknown function> + 0xecdb4 (0x74c9ee4ecdb4 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #4: <unknown function> + 0x9caa4 (0x74c9f109caa4 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #5: <unknown function> + 0x129c6c (0x74c9f1129c6c in /lib/x86_64-linux-gnu/libc.so.6)
+
+[rank0]:[E1116 19:00:27.782365538 ProcessGroupNCCL.cpp:744] [Rank 0] Some NCCL operations have failed or timed out. Due to the asynchronous nature of CUDA kernels, subsequent GPU operations might run on corrupted/incomplete data.
+[rank0]:[E1116 19:00:27.782408809 ProcessGroupNCCL.cpp:758] [Rank 0] To avoid data inconsistency, we are taking the entire process down.
+[rank0]:[E1116 19:00:27.786419928 ProcessGroupNCCL.cpp:2057] [PG ID 0 PG GUID 0(default_pg) Rank 0] Process group watchdog thread terminated with exception: [Rank 0] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=32114355, OpType=_ALLGATHER_BASE, NumelIn=65, NumelOut=260, Time
+out(ms)=600000) ran for 600035 milliseconds before timing out.
+Exception raised from checkTimeout at /pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:686 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x779c46977b80 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: c10d::ProcessGroupNCCL::WorkNCCL::checkTimeout(std::optional<std::chrono::duration<long, std::ratio<1l, 1000l> > >) + 0x247 (0x779bcca8d9d7 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: c10d::ProcessGroupNCCL::Watchdog::runLoop() + 0x1691 (0x779bcca925e1 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: c10d::ProcessGroupNCCL::Watchdog::run() + 0xdf (0x779bcca9382f in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #4: <unknown function> + 0xecdb4 (0x779c55eecdb4 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #5: <unknown function> + 0x9caa4 (0x779c58c9caa4 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #6: <unknown function> + 0x129c6c (0x779c58d29c6c in /lib/x86_64-linux-gnu/libc.so.6)
+
+terminate called after throwing an instance of 'c10::DistBackendError'
+  what():  [PG ID 0 PG GUID 0(default_pg) Rank 0] Process group watchdog thread terminated with exception: [Rank 0] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=32114355, OpType=_ALLGATHER_BASE, NumelIn=65, NumelOut=260, Timeout(ms)=600000) ran for 600035 milliseconds before
+ timing out.
+Exception raised from checkTimeout at /pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:686 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x779c46977b80 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: c10d::ProcessGroupNCCL::WorkNCCL::checkTimeout(std::optional<std::chrono::duration<long, std::ratio<1l, 1000l> > >) + 0x247 (0x779bcca8d9d7 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: c10d::ProcessGroupNCCL::Watchdog::runLoop() + 0x1691 (0x779bcca925e1 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: c10d::ProcessGroupNCCL::Watchdog::run() + 0xdf (0x779bcca9382f in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #4: <unknown function> + 0xecdb4 (0x779c55eecdb4 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #5: <unknown function> + 0x9caa4 (0x779c58c9caa4 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #6: <unknown function> + 0x129c6c (0x779c58d29c6c in /lib/x86_64-linux-gnu/libc.so.6)
+
+Exception raised from run at /pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:2063 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x779c46977b80 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0xe69b51 (0x779bcca69b51 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: <unknown function> + 0x951271 (0x779bcc551271 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: <unknown function> + 0xecdb4 (0x779c55eecdb4 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #4: <unknown function> + 0x9caa4 (0x779c58c9caa4 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #5: <unknown function> + 0x129c6c (0x779c58d29c6c in /lib/x86_64-linux-gnu/libc.so.6)
+
+Traceback (most recent call last):
+[rank2]:[E1116 19:00:27.813150568 ProcessGroupNCCL.cpp:744] [Rank 2] Some NCCL operations have failed or timed out. Due to the asynchronous nature of CUDA kernels, subsequent GPU operations might run on corrupted/incomplete data.
+[rank2]:[E1116 19:00:27.813196689 ProcessGroupNCCL.cpp:758] [Rank 2] To avoid data inconsistency, we are taking the entire process down.
+[rank2]:[E1116 19:00:27.817146291 ProcessGroupNCCL.cpp:2057] [PG ID 0 PG GUID 0(default_pg) Rank 2] Process group watchdog thread terminated with exception: [Rank 2] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=32114355, OpType=_ALLGATHER_BASE, NumelIn=65, NumelOut=260, Time
+out(ms)=600000) ran for 600093 milliseconds before timing out.
+Exception raised from checkTimeout at /pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:686 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7383e2577b80 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: c10d::ProcessGroupNCCL::WorkNCCL::checkTimeout(std::optional<std::chrono::duration<long, std::ratio<1l, 1000l> > >) + 0x247 (0x73836868d9d7 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: c10d::ProcessGroupNCCL::Watchdog::runLoop() + 0x1691 (0x7383686925e1 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: c10d::ProcessGroupNCCL::Watchdog::run() + 0xdf (0x73836869382f in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #4: <unknown function> + 0xecdb4 (0x7383f1aecdb4 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #5: <unknown function> + 0x9caa4 (0x7383f489caa4 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #6: <unknown function> + 0x129c6c (0x7383f4929c6c in /lib/x86_64-linux-gnu/libc.so.6)
+
+terminate called after throwing an instance of 'c10::DistBackendError'
+  what():  [PG ID 0 PG GUID 0(default_pg) Rank 2] Process group watchdog thread terminated with exception: [Rank 2] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=32114355, OpType=_ALLGATHER_BASE, NumelIn=65, NumelOut=260, Timeout(ms)=600000) ran for 600093 milliseconds before
+ timing out.
+Exception raised from checkTimeout at /pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:686 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7383e2577b80 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: c10d::ProcessGroupNCCL::WorkNCCL::checkTimeout(std::optional<std::chrono::duration<long, std::ratio<1l, 1000l> > >) + 0x247 (0x73836868d9d7 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: c10d::ProcessGroupNCCL::Watchdog::runLoop() + 0x1691 (0x7383686925e1 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: c10d::ProcessGroupNCCL::Watchdog::run() + 0xdf (0x73836869382f in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #4: <unknown function> + 0xecdb4 (0x7383f1aecdb4 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #5: <unknown function> + 0x9caa4 (0x7383f489caa4 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #6: <unknown function> + 0x129c6c (0x7383f4929c6c in /lib/x86_64-linux-gnu/libc.so.6)
+
+Exception raised from run at /pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:2063 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7383e2577b80 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0xe69b51 (0x738368669b51 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: <unknown function> + 0x951271 (0x738368151271 in /home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: <unknown function> + 0xecdb4 (0x7383f1aecdb4 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #4: <unknown function> + 0x9caa4 (0x7383f489caa4 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #5: <unknown function> + 0x129c6c (0x7383f4929c6c in /lib/x86_64-linux-gnu/libc.so.6)
+
+W1116 19:00:28.442000 2155707 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 2155727 closing signal SIGTERM
+W1116 19:00:28.445000 2155707 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 2155729 closing signal SIGTERM
+E1116 19:00:32.081000 2155707 torch/distributed/elastic/multiprocessing/api.py:882] failed (exitcode: -6) local_rank: 1 (pid: 2155728) of binary: /home/katayama/face_recognition_train/.venv/bin/python3
+Traceback (most recent call last):
+  File "/home/katayama/face_recognition_train/.venv/bin/torchrun", line 10, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 357, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/distributed/run.py", line 936, in main
+    run(args)
+  File "/home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/distributed/run.py", line 927, in run
+    elastic_launch(
+  File "/home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 156, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/katayama/face_recognition_train/.venv/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 293, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError:
+========================================================
+train_v2.py FAILED
+--------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+--------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2025-11-16_19:00:28
+  host      : tg1
+  rank      : 1 (local_rank: 1)
+  exitcode  : -6 (pid: 2155728)
+  error_file: <N/A>
+  traceback : Signal 6 (SIGABRT) received by PID 2155728
+========================================================

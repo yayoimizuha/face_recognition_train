@@ -31,6 +31,7 @@ dependencies = [
     "mkl~=2025.2",
     "schedulefree~=1.4",
     "torch-optimizer~=0.3",
+    "torchinfo~=1.8",
 #    "intel-extension-for-pytorch"
 ]
 

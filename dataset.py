@@ -458,7 +458,9 @@ def dali_data_iter(
             jpegs, labels = fn.readers.file(
                 file_root=src,
                 random_shuffle=random_shuffle,
-                pad_last_batch=False,
+                # pad_last_batch を True にし、全 rank で常に同一 batch_size を維持し、
+                # PartialFC の all_gather でサイズ不一致による NCCL ハングを防ぐ。
+                pad_last_batch=True,
                 name=name,
                 shard_id=rank,
                 num_shards=world_size,
@@ -482,7 +484,8 @@ def dali_data_iter(
                 paths=shards,
                 ext=["jpg", "cls"],
                 random_shuffle=random_shuffle,
-                pad_last_batch=False,
+                # WebDataset でも最終バッチが揃わないケースがあるため True に設定。
+                pad_last_batch=True,
                 name=name,
                 shard_id=rank,
                 num_shards=world_size,

@@ -23,6 +23,11 @@ config.embedding_size = 512
 # Device selection: "cuda" | "xpu" | "cpu"
 config.device_type = "cuda"
 
+# Apply Global Depthwise Convolution head instead of default pooling/classifier
+# When True, timm-based backbones will replace their head with GDConv that
+# computes a depthwise HxW conv followed by 1x1 conv to produce `embedding_size`.
+config.apply_gdconv = False
+
 # Partial FC
 config.sample_rate = 1
 config.interclass_filtering_threshold = 0

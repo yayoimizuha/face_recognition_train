@@ -172,7 +172,13 @@ def main(args):
         device_type=device_type,
     )
 
-    backbone = get_model(cfg.network, dropout=0.0, amp=cfg.amp, num_features=cfg.embedding_size).to(device)
+    backbone = get_model(
+        cfg.network,
+        dropout=0.0,
+        amp=cfg.amp,
+        num_features=cfg.embedding_size,
+        apply_gdconv=cfg.apply_gdconv,
+    ).to(device)
 
     # Convert BatchNorm layers to SyncBatchNorm for proper distributed training
     backbone = convert_sync_batchnorm(backbone)

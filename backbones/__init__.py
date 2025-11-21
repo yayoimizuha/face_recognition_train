@@ -57,15 +57,6 @@ def get_model(name, **kwargs):
         num_features = kwargs.get("num_features", 512)
         amp = kwargs.get("amp", torch.float16)
         return get_mbf_large(fp16=fp16, num_features=num_features, amp=amp)
-    
-    elif name.startswith('hf-hub:gdconv:'):
-        # Example: 'hf-hub:gdconv:owner/repo-or-model-id'
-        model_id = name.split(':', 2)[2]
-        return get_timmfr_gdconv(f'hf-hub:{model_id}', **kwargs)
-    elif name.startswith('gdconv:'):
-        # Example: 'gdconv:edgenext_x_small'
-        model_id = name.split(':', 1)[1]
-        return get_timmfr_gdconv(model_id, **kwargs)
     elif name.startswith('hf-hub:'):
         return get_timmfrv2(name, batchnorm=False, **kwargs)
     else:

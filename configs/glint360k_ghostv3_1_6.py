@@ -12,16 +12,16 @@ config.sample_rate = 1.0
 config.device_type = "cuda"
 config.dist_backend = "nccl"  # 明示指定（"gloo"|"ccl"|"nccl"）
 # config.fp16 = True  # legacy flag; kept for backward compatibility
-config.amp = torch.float32  # set torch dtype directly
+config.amp = torch.bfloat16  # set torch dtype directly
 # config.momentum = 0.9
-config.batch_size = 256
+config.batch_size = 1024
 config.verbose = 500
 config.dali = False
 
-config.optimizer = "adamw"
-config.adam_betas = (0.9, 0.999)
-config.lr = 0.006
-config.weight_decay = 0.1
+config.optimizer = "lamb"
+config.adam_betas = (0.9, 0.9999)
+config.lr = 0.005
+config.weight_decay = 0.05
 
 # DataLoader 用
 config.num_workers = 20
@@ -32,6 +32,6 @@ config.dataset_type = "webdataset"
 # Glint360k のクラス数と画像枚数（スケジューラ計算用）
 config.num_classes = 360232
 config.num_image = 17091657
-config.num_epoch = 25
+config.num_epoch = 50
 config.warmup_epoch = 2
 config.val_targets = ["lfw", "cfp_fp", "agedb_30"]
