@@ -11,7 +11,7 @@ located in the parent directory of this source code repository.
 For inquiries, please contact the author at anjith.george@idiap.ch
 ===============================================================================
 """
-from .timmfr import get_timmfrv2, replace_linear_with_lowrank_2, replace_activation_function, get_timmfr_gdconv
+from .timmfr import get_timmfrv2, replace_linear_with_lowrank_2, replace_activation_function
 from .iresnet import iresnet18, iresnet34, iresnet50, iresnet100, iresnet200
 from .mobilefacenet import get_mbf,get_mbf_large
 
