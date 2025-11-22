@@ -62,7 +62,7 @@ class BaseWithGDConv(nn.Module):
         return self.gd_head(fm)
 
 
-def build_gdconv_wrapper(base_model: nn.Module, out_channels: int, dummy_shape=(1, 3, 224, 224)) -> nn.Module:
+def build_gdconv_wrapper(base_model: nn.Module, out_channels: int, dummy_shape=(1, 3, 112, 112)) -> nn.Module:
     strip_after_head_or_pool(base_model)
     dummy = torch.zeros(*dummy_shape)
     with torch.no_grad():

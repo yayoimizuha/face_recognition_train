@@ -91,18 +91,17 @@ if __name__ == "__main__":
     )
 
     print(model)
-    summary(model, input_size=(1, 3, 224, 224))
+    summary(model, input_size=(1, 3, 112, 112))
 
     # 動的に head/SelectAdaptivePool2d 以降を無効化
     strip_after_head_or_pool(model)
 
     print(model)
-    summary(model, input_size=(1, 3, 224, 224))
+    summary(model, input_size=(1, 3, 112, 112))
 
     model.cpu()
 
-    dummy = torch.randn(4, 3, 224, 224)
-
+    dummy = torch.randn(4, 3, 112, 112)
     # 特徴マップ取得（strip 後は head/pool が Identity なのでそのまま forward）
     out = model(dummy)
     assert out.dim() == 4  # (B, C, H, W)
@@ -116,4 +115,4 @@ if __name__ == "__main__":
     print("final out:", final_out.shape)
 
     print("Model with GDConvHead:", wrapped)
-    summary(wrapped, input_size=(4, 3, 224, 224))
+    summary(wrapped, input_size=(4, 3, 112, 112))
