@@ -159,7 +159,15 @@ def main(args):
             print("WandB Data (Entity and Project name) must be provided in config file (base.py).")
             print(f"Config Error: {e}")
     # DALI は CUDA 前提のため、非 CUDA 環境では自動で無効化
-    dali_enabled = bool(getattr(cfg, "dali", False) and device.type == "cuda")
+    dali_enabled = bool(cfg.dali and device.type == "cuda")
+    samples_per_rank = None
+    if cfg.dataset_type.lower() == "webdataset":
+        # Force identical epoch length across ranks so PartialFC all_gather stays in sync
+        steps_per_epoch = cfg.num_image // (cfg.batch_size * world_size)
+        if steps_per_epoch == 0:
+            raise ValueError("cfg.num_image must be at least batch_size * world_size for WebDataset training")
+        samples_per_rank = steps_per_epoch * cfg.batch_size
+
     train_loader = get_dataloader(
         cfg.rec,
         local_rank,
@@ -168,8 +176,9 @@ def main(args):
         cfg.dali_aug,
         cfg.seed,
         cfg.num_workers,
-        getattr(cfg, "dataset_type", "imagefolder"),
+        cfg.dataset_type,
         device_type=device_type,
+        samples_per_rank=samples_per_rank,
     )
 
     backbone = get_model(

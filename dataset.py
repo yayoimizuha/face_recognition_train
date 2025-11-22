@@ -1,8 +1,9 @@
 import numbers
 import os
 import queue as Queue
+import random
 import threading
-from typing import Iterable, Union, List, Any, cast
+from typing import Iterable, Union, List, Any, cast, Optional
 
 import numpy as np
 import torch
@@ -48,10 +49,12 @@ def get_dataloader(
     num_workers: int = 2,
     dataset_type: str = "imagefolder",
     device_type: str | None = None,
+    samples_per_rank: Optional[int] = None,
     ) -> Iterable:
 
     train_set = None
     ds_type = (dataset_type or "imagefolder").lower()
+    rank, world_size = get_dist_info()
 
     transform = transforms.Compose([
          transforms.RandomHorizontalFlip(),
@@ -86,7 +89,13 @@ def get_dataloader(
     # WebDataset shards
     elif ds_type == "webdataset" and not dali:
         # Python WebDataset pipeline (non-DALI)
-        train_set = _build_webdataset(root_dir)
+        train_set = _build_webdataset(
+            src=root_dir,
+            batch_size=batch_size,
+            samples_per_rank=samples_per_rank,
+            seed=seed,
+            rank=rank,
+        )
 
     # Image Folder
     elif ds_type == "imagefolder" and not dali:
@@ -98,8 +107,6 @@ def get_dataloader(
         train_set = SafeImageFolder(root_dir, transform)
 
     # DALI already handled above
-
-    rank, world_size = get_dist_info()
     # IterableDataset (WebDataset) cannot use a Sampler; use internal sharding and shuffling
     if ds_type == "webdataset" and not dali:
         if seed is None:
@@ -140,7 +147,13 @@ def get_dataloader(
     return train_loader
 
 
-def _build_webdataset(src: str):
+def _build_webdataset(
+    src: str,
+    batch_size: int,
+    samples_per_rank: Optional[int],
+    seed: Optional[int],
+    rank: int,
+):
     """Build a WebDataset pipeline from a directory, pattern, list file, or URL.
 
     Expected sample keys: image ext in {jpg,jpeg,png} and integer label in 'cls'.
@@ -222,6 +235,10 @@ def _build_webdataset(src: str):
         lbl = decode_label(lbl)
         return img, lbl
 
+    shuffle_rng = None
+    if seed is not None:
+        shuffle_rng = random.Random(seed + rank)
+
     dataset = (
         wds.WebDataset(
             shards,
@@ -231,12 +248,20 @@ def _build_webdataset(src: str):
             handler=getattr(wds, 'warn_and_continue', None),
             empty_check=False,  # allow some workers to have zero shards without raising
         )
-        .shuffle(10000)
+        .shuffle(10000, rng=shuffle_rng)
         .decode("pil")
         # Accept common image extensions; for label, try various common keys
         .to_tuple("jpg;jpeg;png;webp", "cls;cls.txt;label;label.txt;json")
         .map(preprocess)
     )
+
+    if samples_per_rank:
+        target = max(samples_per_rank, batch_size)
+        remainder = target % batch_size
+        if remainder != 0:
+            target += batch_size - remainder
+        dataset = dataset.repeat().with_epoch(target)
+        dataset.length = target  # type: ignore[attr-defined]
 
     return dataset
 
