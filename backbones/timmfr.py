@@ -15,8 +15,7 @@ For inquiries, please contact the author at anjith.george@idiap.ch
 import timm
 import torch
 import torch.nn as nn
-import math
-from .gdconv import GDConvHead
+from .gdconv import build_gdconv_wrapper
 
 
 class LoRaLin(nn.Module):
@@ -87,26 +86,21 @@ class TimmFRWrapperV2(nn.Module):
         self.apply_gdconv = apply_gdconv
         if "untrained" in self.model_name:
             pretrained = False
-        self.model = timm.create_model(self.model_name, pretrained=pretrained, drop_rate=dropout)
+        base = timm.create_model(
+            self.model_name, pretrained=pretrained, drop_rate=dropout
+        )
         if not self.apply_gdconv:
-            self.model.reset_classifier(self.featdim)  # type: ignore
+            base.reset_classifier(self.featdim)  # type: ignore
+            self.model = base
         else:
-            # 一度 head を Identity にして空間特徴を取得
-            if hasattr(self.model, "head"):
-                self.model.head = nn.Identity()
-
-            c_in, h_in, w_in = (3, 224, 224)
-            dummy = torch.zeros(1, c_in, h_in, w_in)
-            with torch.no_grad():
-                feats = self.model(dummy)
-            if feats.dim() != 4:
-                raise ValueError(f"GDConv requires spatial feature map (B,C,H,W). Got {tuple(feats.shape)}")
-            _, c, h, w = feats.shape
-            # 差し替え: (B,C,H,W)->(B,featdim)
-            self.model.head = GDConvHead(in_channels=c, h=h, w=w, out_channels=self.featdim)
+            self.model = build_gdconv_wrapper(base, self.featdim)
 
     def forward(self, x):
-        with torch.autocast(device_type=x.device.type, dtype=self.amp_dtype, enabled=(self.amp_dtype is not None)):
+        with torch.autocast(
+            device_type=x.device.type,
+            dtype=self.amp_dtype,
+            enabled=(self.amp_dtype is not None),
+        ):
             out = self.model(x)
         return out.float()
 
