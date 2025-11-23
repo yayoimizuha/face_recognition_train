@@ -216,8 +216,13 @@ def main(args):
         raise
 
     cfg.total_batch_size = cfg.batch_size * world_size
-    cfg.warmup_step = cfg.num_image // cfg.total_batch_size * cfg.warmup_epoch
-    cfg.total_step = cfg.num_image // cfg.total_batch_size * cfg.num_epoch
+    cfg.steps_per_epoch = cfg.num_image // cfg.total_batch_size
+    if cfg.steps_per_epoch == 0:
+        raise ValueError(
+            "steps_per_epoch computed to 0. Dataset is too small for the configured batch_size * world_size; reduce the total batch size or adjust num_image."
+        )
+    cfg.warmup_step = cfg.steps_per_epoch * cfg.warmup_epoch
+    cfg.total_step = cfg.steps_per_epoch * cfg.num_epoch
 
     # RAdamScheduleFree doesn't need a separate learning rate scheduler
     if cfg.optimizer == "radam_schedulefree":
@@ -275,7 +280,9 @@ def main(args):
             sampler = getattr(train_loader, "sampler", None)
             if sampler is not None and hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
-        for _, (img, local_labels) in enumerate(train_loader):
+        for step, (img, local_labels) in enumerate(train_loader):
+            if step >= cfg.steps_per_epoch:
+                break
             global_step += 1
             # Ensure tensors are on the right device
             try:
