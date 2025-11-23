@@ -287,9 +287,28 @@ def main(args):
             sampler = train_loader.sampler
             if hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
-        for step, (img, local_labels) in enumerate(train_loader):
-            if step >= cfg.steps_per_epoch:
-                break
+        steps_this_epoch = 0
+        data_iter = iter(train_loader)
+        while steps_this_epoch < cfg.steps_per_epoch:
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                if cfg.dataset_type != "webdataset":
+                    raise RuntimeError(
+                        f"DataLoader exhausted after {steps_this_epoch} steps, but cfg.steps_per_epoch={cfg.steps_per_epoch}. "
+                        "Adjust num_image/steps_per_epoch or ensure the dataset has enough samples."
+                    )
+                logging.warning(
+                    "Rank %d WebDataset iterator exhausted at epoch %d step %d; retrying new iterator.",
+                    rank,
+                    epoch,
+                    steps_this_epoch,
+                )
+                data_iter = iter(train_loader)
+                continue
+
+            img, local_labels = batch
+            steps_this_epoch += 1
             global_step += 1
             # Ensure tensors are on the right device
             try:
@@ -351,6 +370,15 @@ def main(args):
                     # Put optimizer back in train mode
                     if cfg.optimizer == "radam_schedulefree":
                         opt.train()
+
+        if rank == 0:
+            logging.info(
+                "Epoch %d finished with %d/%d steps (global_step=%d)",
+                epoch,
+                steps_this_epoch,
+                cfg.steps_per_epoch,
+                global_step,
+            )
 
         if cfg.save_all_states:
             # Put optimizer in eval mode for checkpoint saving when using RAdamScheduleFree

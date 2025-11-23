@@ -274,15 +274,35 @@ def main(args):
     # Enable GradScaler when AMP dtype is set (also on CPU)
     amp = GradScaler(device=device_type, enabled=(cfg.amp is not None), growth_interval=100)
 
+
     for epoch in range(start_epoch, cfg.num_epoch):
 
         if isinstance(train_loader, DataLoader):
             sampler = getattr(train_loader, "sampler", None)
             if sampler is not None and hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
-        for step, (img, local_labels) in enumerate(train_loader):
-            if step >= cfg.steps_per_epoch:
-                break
+        steps_this_epoch = 0
+        data_iter = iter(train_loader)
+        while steps_this_epoch < cfg.steps_per_epoch:
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                if cfg.dataset_type != "webdataset":
+                    raise RuntimeError(
+                        f"DataLoader exhausted after {steps_this_epoch} steps, but cfg.steps_per_epoch={cfg.steps_per_epoch}. "
+                        "Adjust num_image/steps_per_epoch or ensure the dataset has enough samples."
+                    )
+                logging.warning(
+                    "Rank %d WebDataset iterator exhausted at epoch %d step %d; retrying new iterator.",
+                    rank,
+                    epoch,
+                    steps_this_epoch,
+                )
+                data_iter = iter(train_loader)
+                continue
+
+            img, local_labels = batch
+            steps_this_epoch += 1
             global_step += 1
             # Ensure tensors are on the right device
             try:
