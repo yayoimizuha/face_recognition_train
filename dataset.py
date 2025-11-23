@@ -100,7 +100,9 @@ def get_dataloader(
     # DALI already handled above
 
     rank, world_size = get_dist_info()
-    pin_memory_enabled = torch.cuda.is_available() and (device_type in (None, "cuda")) and ds_type != "webdataset"
+
+    # Enable pinned host memory whenever CUDA or XPU execution is requested/available.
+    pin_memory_enabled = device_type in ("cuda", "xpu")
 
     # IterableDataset (WebDataset) cannot use a Sampler; use internal sharding and shuffling
     if ds_type == "webdataset" and not dali:
