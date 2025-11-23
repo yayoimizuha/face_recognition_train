@@ -424,6 +424,14 @@ def main(args):
             model.add_file(path_module)
             wandb_logger.log_artifact(model)
 
+    # Cleanup to avoid warnings on exit
+    del train_loader
+    del backbone
+    del module_partial_fc
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    distributed.destroy_process_group()
+
 
 if __name__ == "__main__":
     # Enable cudnn benchmark only when available (CUDA)
