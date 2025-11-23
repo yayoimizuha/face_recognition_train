@@ -100,6 +100,8 @@ def get_dataloader(
     # DALI already handled above
 
     rank, world_size = get_dist_info()
+    pin_memory_enabled = torch.cuda.is_available() and (device_type in (None, "cuda")) and ds_type != "webdataset"
+
     # IterableDataset (WebDataset) cannot use a Sampler; use internal sharding and shuffling
     if ds_type == "webdataset" and not dali:
         if seed is None:
@@ -112,7 +114,7 @@ def get_dataloader(
             dataset=train_set,
             batch_size=batch_size,
             num_workers=num_workers,
-            pin_memory=torch.cuda.is_available() and (device_type in (None, "cuda")),
+            pin_memory=pin_memory_enabled,
             drop_last=True,
             worker_init_fn=init_fn,
         )
@@ -132,7 +134,7 @@ def get_dataloader(
             batch_size=batch_size,
             sampler=train_sampler,
             num_workers=num_workers,
-            pin_memory=(torch.cuda.is_available() and (device_type in (None, "cuda"))),
+            pin_memory=pin_memory_enabled,
             drop_last=True,
             worker_init_fn=init_fn,
         )
