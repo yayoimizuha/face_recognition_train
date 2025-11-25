@@ -63,7 +63,11 @@ def _setup_mpi_env_for_torch() -> None:
                 env["LOCAL_RANK"] = env[k]
                 break
     # MASTER_PORT は未設定ならデフォルトを補完
-    if "WORLD_SIZE" in env and env["WORLD_SIZE"].isdigit() and int(env["WORLD_SIZE"]) > 1:
+    if (
+        "WORLD_SIZE" in env
+        and env["WORLD_SIZE"].isdigit()
+        and int(env["WORLD_SIZE"]) > 1
+    ):
         env.setdefault("MASTER_PORT", "29500")
         env.setdefault("MASTER_ADDR", "127.0.0.1")
 
@@ -80,10 +84,16 @@ def main(args):
     device_type = requested_device
     # validate availability; if requested but unavailable, fall back
     if requested_device == "cuda" and not torch.cuda.is_available():
-        logging.warning("Requested device 'cuda' is unavailable. Falling back to detected '%s'", detected_device)
+        logging.warning(
+            "Requested device 'cuda' is unavailable. Falling back to detected '%s'",
+            detected_device,
+        )
         device_type = detected_device
     if requested_device == "xpu" and not torch.xpu.is_available():
-        logging.warning("Requested device 'xpu' is unavailable. Falling back to detected '%s'", detected_device)
+        logging.warning(
+            "Requested device 'xpu' is unavailable. Falling back to detected '%s'",
+            detected_device,
+        )
         device_type = detected_device
 
     # Select backend from config（auto廃止・未知は即クラッシュ）
@@ -94,13 +104,17 @@ def main(args):
 
     # backend 可用性の検証とフォールバック
     if dist_backend == "nccl" and not torch.cuda.is_available():
-        logging.warning("NCCL requested/selected but CUDA is unavailable. Falling back to 'gloo'.")
+        logging.warning(
+            "NCCL requested/selected but CUDA is unavailable. Falling back to 'gloo'."
+        )
         dist_backend = "gloo"
     if dist_backend == "ccl":
         try:
             import oneccl_bindings_for_pytorch  # noqa: F401
         except Exception as e:
-            logging.warning("oneCCL backend 'ccl' is not available (%s). Falling back to 'gloo'.", e)
+            logging.warning(
+                "oneCCL backend 'ccl' is not available (%s). Falling back to 'gloo'.", e
+            )
             dist_backend = "gloo"
 
     # init process group
@@ -132,7 +146,11 @@ def main(args):
     os.makedirs(cfg.output, exist_ok=True)
     init_logging(rank, cfg.output)
 
-    summary_writer = SummaryWriter(log_dir=os.path.join(cfg.output, "tensorboard")) if rank == 0 else None
+    summary_writer = (
+        SummaryWriter(log_dir=os.path.join(cfg.output, "tensorboard"))
+        if rank == 0
+        else None
+    )
 
     wandb_logger = None
     if cfg.using_wandb and rank == 0:
@@ -146,17 +164,30 @@ def main(args):
             print(f"Config Error: {e}")
         # Initialize wandb
         run_name = datetime.now().strftime("%y%m%d_%H%M") + f"_GPU{rank}"
-        run_name = run_name if cfg.suffix_run_name is None else run_name + f"_{cfg.suffix_run_name}"
+        run_name = (
+            run_name
+            if cfg.suffix_run_name is None
+            else run_name + f"_{cfg.suffix_run_name}"
+        )
         try:
             wandb_logger = (
-                wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, sync_tensorboard=True, resume=cfg.wandb_resume, name=run_name, notes=cfg.notes)
+                wandb.init(
+                    entity=cfg.wandb_entity,
+                    project=cfg.wandb_project,
+                    sync_tensorboard=True,
+                    resume=cfg.wandb_resume,
+                    name=run_name,
+                    notes=cfg.notes,
+                )
                 if rank == 0 or cfg.wandb_log_all
                 else None
             )
             if wandb_logger:
                 wandb_logger.config.update(cfg)
         except Exception as e:
-            print("WandB Data (Entity and Project name) must be provided in config file (base.py).")
+            print(
+                "WandB Data (Entity and Project name) must be provided in config file (base.py)."
+            )
             print(f"Config Error: {e}")
     # DALI は CUDA 前提のため、非 CUDA 環境では自動で無効化
     dali_enabled = bool(getattr(cfg, "dali", False) and device.type == "cuda")
@@ -199,42 +230,94 @@ def main(args):
     # FIXME using gradient checkpoint if there are some unused parameters will cause error
     backbone._set_static_graph()
 
-    margin_loss = CombinedMarginLoss(64, cfg.margin_list[0], cfg.margin_list[1], cfg.margin_list[2], cfg.interclass_filtering_threshold)
+    margin_loss = CombinedMarginLoss(
+        64,
+        cfg.margin_list[0],
+        cfg.margin_list[1],
+        cfg.margin_list[2],
+        cfg.interclass_filtering_threshold,
+    )
 
     if cfg.optimizer == "sgd":
-        module_partial_fc = PartialFC_V2(margin_loss, cfg.embedding_size, cfg.num_classes, cfg.sample_rate, False, amp=cfg.amp)
+        module_partial_fc = PartialFC_V2(
+            margin_loss,
+            cfg.embedding_size,
+            cfg.num_classes,
+            cfg.sample_rate,
+            False,
+            amp=cfg.amp,
+        )
         module_partial_fc.train().to(device)
         # TODO the params of partial fc must be last in the params list
         opt = torch.optim.SGD(
-            params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}], lr=cfg.lr, momentum=0.9, weight_decay=cfg.weight_decay
+            params=[
+                {"params": backbone.parameters()},
+                {"params": module_partial_fc.parameters()},
+            ],
+            lr=cfg.lr,
+            momentum=0.9,
+            weight_decay=cfg.weight_decay,
         )
 
     elif cfg.optimizer == "adamw":
-        module_partial_fc = PartialFC_V2(margin_loss, cfg.embedding_size, cfg.num_classes, cfg.sample_rate, False, amp=cfg.amp)
+        module_partial_fc = PartialFC_V2(
+            margin_loss,
+            cfg.embedding_size,
+            cfg.num_classes,
+            cfg.sample_rate,
+            False,
+            amp=cfg.amp,
+        )
         module_partial_fc.train().to(device)
         betas = tuple(getattr(cfg, "adam_betas", (0.9, 0.999)))
         opt = torch.optim.AdamW(
-            params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}], lr=cfg.lr, weight_decay=cfg.weight_decay, betas=betas
+            params=[
+                {"params": backbone.parameters()},
+                {"params": module_partial_fc.parameters()},
+            ],
+            lr=cfg.lr,
+            weight_decay=cfg.weight_decay,
+            betas=betas,
         )
     elif cfg.optimizer == "radam_schedulefree":
-        module_partial_fc = PartialFC_V2(margin_loss, cfg.embedding_size, cfg.num_classes, cfg.sample_rate, False, amp=cfg.amp)
+        module_partial_fc = PartialFC_V2(
+            margin_loss,
+            cfg.embedding_size,
+            cfg.num_classes,
+            cfg.sample_rate,
+            False,
+            amp=cfg.amp,
+        )
         module_partial_fc.train().to(device)
         betas = tuple(getattr(cfg, "adam_betas", (0.9, 0.999)))
         opt = RAdamScheduleFree(
-            params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}], 
-            lr=cfg.lr, 
+            params=[
+                {"params": backbone.parameters()},
+                {"params": module_partial_fc.parameters()},
+            ],
+            lr=cfg.lr,
             betas=betas,
-            weight_decay=cfg.weight_decay
+            weight_decay=cfg.weight_decay,
         )
     elif cfg.optimizer == "lamb":
-        module_partial_fc = PartialFC_V2(margin_loss, cfg.embedding_size, cfg.num_classes, cfg.sample_rate, False, amp=cfg.amp)
+        module_partial_fc = PartialFC_V2(
+            margin_loss,
+            cfg.embedding_size,
+            cfg.num_classes,
+            cfg.sample_rate,
+            False,
+            amp=cfg.amp,
+        )
         module_partial_fc.train().to(device)
         betas = tuple(getattr(cfg, "adam_betas", (0.9, 0.999)))
         opt = Lamb(
-            params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}],
+            params=[
+                {"params": backbone.parameters()},
+                {"params": module_partial_fc.parameters()},
+            ],
             lr=cfg.lr,
             betas=betas,
-            weight_decay=cfg.weight_decay
+            weight_decay=cfg.weight_decay,
         )
     else:
         raise
@@ -253,12 +336,16 @@ def main(args):
         lr_scheduler = DummyScheduler(optimizer=opt)
         opt.train()  # Initialize optimizer in train mode
     else:
-        lr_scheduler = PolynomialLRWarmup(optimizer=opt, warmup_iters=cfg.warmup_step, total_iters=cfg.total_step)
+        lr_scheduler = PolynomialLRWarmup(
+            optimizer=opt, warmup_iters=cfg.warmup_step, total_iters=cfg.total_step
+        )
 
     start_epoch = 0
     global_step = 0
     if cfg.resume:
-        dict_checkpoint = torch.load(os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
+        dict_checkpoint = torch.load(
+            os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt")
+        )
         start_epoch = dict_checkpoint["epoch"]
         global_step = dict_checkpoint["global_step"]
         backbone.module.load_state_dict(dict_checkpoint["state_dict_backbone"])
@@ -272,14 +359,25 @@ def main(args):
         logging.info(": " + key + " " * num_space + str(value))
 
     ver_prefix = getattr(cfg, "val_dir", None) or cfg.rec
-    callback_verification = CallBackVerification(val_targets=cfg.val_targets, rec_prefix=ver_prefix, summary_writer=summary_writer, wandb_logger=wandb_logger)
+    callback_verification = CallBackVerification(
+        val_targets=cfg.val_targets,
+        rec_prefix=ver_prefix,
+        summary_writer=summary_writer,
+        wandb_logger=wandb_logger,
+    )
     callback_logging = CallBackLogging(
-        frequent=cfg.frequent, total_step=cfg.total_step, batch_size=cfg.batch_size, start_step=global_step, writer=summary_writer
+        frequent=cfg.frequent,
+        total_step=cfg.total_step,
+        batch_size=cfg.batch_size,
+        start_step=global_step,
+        writer=summary_writer,
     )
 
     loss_am = AverageMeter()
     # Enable GradScaler when AMP dtype is set (also on CPU)
-    amp = GradScaler(device=device_type, enabled=(cfg.amp is not None), growth_interval=100)
+    amp = GradScaler(
+        device=device_type, enabled=(cfg.amp is not None), growth_interval=100
+    )
 
     for epoch in range(start_epoch, cfg.num_epoch):
 
@@ -334,7 +432,9 @@ def main(args):
                     if distributed.get_rank() == 0:
                         for p in backbone.parameters():
                             if p.grad is not None and not torch.isfinite(p.grad).all():
-                                print(f"Gradient is NaN/Inf at step {global_step} (epoch {epoch}).")
+                                print(
+                                    f"Gradient is NaN/Inf at step {global_step} (epoch {epoch})."
+                                )
 
                     torch.nn.utils.clip_grad_norm_(backbone.parameters(), 5)
                     amp.step(opt)
@@ -347,7 +447,9 @@ def main(args):
                     if distributed.get_rank() == 0:
                         for p in backbone.parameters():
                             if p.grad is not None and not torch.isfinite(p.grad).all():
-                                print(f"Gradient is NaN/Inf at step {global_step} (epoch {epoch}).")
+                                print(
+                                    f"Gradient is NaN/Inf at step {global_step} (epoch {epoch})."
+                                )
 
                     torch.nn.utils.clip_grad_norm_(backbone.parameters(), 5)
                     opt.step()
@@ -356,11 +458,25 @@ def main(args):
 
             with torch.no_grad():
                 if wandb_logger:
-                    wandb_logger.log({"Loss/Step Loss": loss.item(), "Loss/Train Loss": loss_am.avg, "Process/Step": global_step, "Process/Epoch": epoch})
+                    wandb_logger.log(
+                        {
+                            "Loss/Step Loss": loss.item(),
+                            "Loss/Train Loss": loss_am.avg,
+                            "Process/Step": global_step,
+                            "Process/Epoch": epoch,
+                        }
+                    )
 
                 if loss.item() > 0:
                     loss_am.update(loss.item(), 1)
-                callback_logging(global_step, loss_am, epoch, amp.is_enabled(), lr_scheduler.get_last_lr()[0], amp)
+                callback_logging(
+                    global_step,
+                    loss_am,
+                    epoch,
+                    amp.is_enabled(),
+                    lr_scheduler.get_last_lr()[0],
+                    amp,
+                )
 
                 if global_step % cfg.verbose == 0 and global_step > 0:
                     # Put optimizer in eval mode for verification when using RAdamScheduleFree
@@ -384,7 +500,7 @@ def main(args):
             # Put optimizer in eval mode for checkpoint saving when using RAdamScheduleFree
             if cfg.optimizer == "radam_schedulefree":
                 opt.eval()
-            
+
             checkpoint = {
                 "epoch": epoch + 1,
                 "global_step": global_step,
@@ -393,8 +509,10 @@ def main(args):
                 "state_optimizer": opt.state_dict(),
                 "state_lr_scheduler": lr_scheduler.state_dict(),
             }
-            torch.save(checkpoint, os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
-            
+            torch.save(
+                checkpoint, os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt")
+            )
+
             # Put optimizer back in train mode
             if cfg.optimizer == "radam_schedulefree":
                 opt.train()
@@ -437,6 +555,8 @@ if __name__ == "__main__":
     # Enable cudnn benchmark only when available (CUDA)
     if hasattr(torch.backends, "cudnn") and torch.backends.cudnn.is_available():
         torch.backends.cudnn.benchmark = True
-    parser = argparse.ArgumentParser(description="Distributed Arcface Training in Pytorch")
+    parser = argparse.ArgumentParser(
+        description="Distributed Arcface Training in Pytorch"
+    )
     parser.add_argument("config", type=str, help="py config file")
     main(parser.parse_args())
