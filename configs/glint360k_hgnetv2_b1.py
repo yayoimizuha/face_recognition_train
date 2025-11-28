@@ -4,7 +4,7 @@ import torch
 config = edict()
 config.margin_list = (1.0, 0.0, 0.4)
 config.network = "hgnetv2_b1.ssld_stage2_ft_in1k"
-config.resume = False
+config.resume = True
 # 出力先（None だと train_v2.py 内の os.path.join でエラーになるため明示）
 config.output = "./work_dirs/glint360k_hgnetv2_b1.ssld_stage2_ft_in1k"
 config.embedding_size = 512
@@ -16,11 +16,11 @@ config.batch_size = 2048
 config.verbose = 500
 config.dali = False
 
-config.apply_gdconv = True
+config.apply_gdconv = False
 
 config.optimizer = "lamb"
 config.adam_betas = (0.9, 0.9999)
-config.lr = 0.005
+config.lr = 0.008
 config.weight_decay = 0.05
 
 # DataLoader 用
@@ -32,6 +32,6 @@ config.dataset_type = "webdataset"
 # Glint360k のクラス数と画像枚数（スケジューラ計算用）
 config.num_classes = 360232
 config.num_image = 17091657
-config.num_epoch = 100
+config.num_epoch = 300
 config.warmup_epoch = 2
 config.val_targets = ["lfw", "cfp_fp", "agedb_30"]

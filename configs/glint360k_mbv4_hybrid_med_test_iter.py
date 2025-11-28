@@ -5,7 +5,7 @@ config = edict()
 config.margin_list = (1.0, 0.0, 0.4)
 config.network = "mobilenetv4_hybrid_medium.ix_e550_r384_in1k"
 config.resume = False
-# 出力先（None だと train_v2.py 内の os.path.join でエラーになるため明示）
+
 config.output = "./work_dirs/glint360k_mbv4_hybrid_med_test_iter"
 config.embedding_size = 512
 config.sample_rate = 1.0
@@ -33,6 +33,6 @@ config.dataset_type = "webdataset"
 # Glint360k のクラス数と画像枚数（スケジューラ計算用）
 config.num_classes = 360232
 config.num_image = 17091657
-config.num_epoch = 3
-config.warmup_epoch = 1
+config.num_epoch = 1
+config.warmup_epoch = 0
 config.val_targets = ['lfw', 'cfp_fp', "agedb_30"]

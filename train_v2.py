@@ -170,12 +170,31 @@ def main(args):
             else run_name + f"_{cfg.suffix_run_name}"
         )
         try:
+            # wandb resume ガード: 直近Runのconfig.outputと一致する場合のみresume
+            should_resume = bool(cfg.wandb_resume)
+            if cfg.wandb_resume:
+                try:
+                    api = wandb.Api()
+                    runs = api.runs(f"{cfg.wandb_entity}/{cfg.wandb_project}")
+                    last_run = runs[0] if len(runs) > 0 else None
+                    last_output = last_run.config.get("output") if last_run else None
+                    should_resume = cfg.wandb_resume and (last_output == cfg.output)
+                    if cfg.wandb_resume and not should_resume:
+                        logging.info(
+                            "WandB: start new run (prev output=%s, current=%s)",
+                            last_output,
+                            cfg.output,
+                        )
+                except Exception:
+                    # API取得に失敗した場合は新規開始
+                    should_resume = False
+
             wandb_logger = (
                 wandb.init(
                     entity=cfg.wandb_entity,
                     project=cfg.wandb_project,
                     sync_tensorboard=True,
-                    resume=cfg.wandb_resume,
+                    resume=should_resume,
                     name=run_name,
                     notes=cfg.notes,
                 )

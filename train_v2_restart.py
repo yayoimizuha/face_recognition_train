@@ -152,6 +152,19 @@ def main(args):
         else None
     )
 
+    # Try to prefetch W&B run id/name from checkpoint for seamless resume
+    resume_wandb_id = None
+    resume_wandb_name = None
+    if cfg.resume:
+        _ckpt_probe = os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt")
+        if os.path.exists(_ckpt_probe):
+            try:
+                _d = torch.load(_ckpt_probe, map_location="cpu", weights_only=False)
+                resume_wandb_id = _d.get("wandb_run_id")
+                resume_wandb_name = _d.get("wandb_run_name")
+            except Exception as e:
+                logging.warning("Could not read checkpoint for wandb metadata: %s", e)
+
     wandb_logger = None
     if cfg.using_wandb and rank == 0:
         import wandb
@@ -163,27 +176,36 @@ def main(args):
             print("WandB Key must be provided in config file (base.py).")
             print(f"Config Error: {e}")
         # Initialize wandb
-        run_name = datetime.now().strftime("%y%m%d_%H%M") + f"_GPU{rank}"
         run_name = (
-            run_name
-            if cfg.suffix_run_name is None
-            else run_name + f"_{cfg.suffix_run_name}"
+            resume_wandb_name
+            if resume_wandb_name is not None
+            else datetime.now().strftime("%y%m%d_%H%M") + f"_GPU{rank}"
         )
+        if cfg.suffix_run_name is not None and resume_wandb_name is None:
+            run_name = run_name + f"_{cfg.suffix_run_name}"
         try:
-            wandb_logger = (
-                wandb.init(
-                    entity=cfg.wandb_entity,
-                    project=cfg.wandb_project,
-                    sync_tensorboard=True,
-                    resume=cfg.wandb_resume,
-                    name=run_name,
-                    notes=cfg.notes,
-                )
-                if rank == 0 or cfg.wandb_log_all
-                else None
+            init_kwargs = dict(
+                entity=cfg.wandb_entity,
+                project=cfg.wandb_project,
+                sync_tensorboard=True,
+                name=run_name,
+                notes=cfg.notes,
             )
+            # If we have a stored run id, resume into that exact run
+            if resume_wandb_id is not None:
+                init_kwargs.update({"id": resume_wandb_id, "resume": "allow"})
+            else:
+                init_kwargs.update({"resume": cfg.wandb_resume})
+
+            wandb_logger = wandb.init(**init_kwargs) if (rank == 0 or cfg.wandb_log_all) else None
             if wandb_logger:
                 wandb_logger.config.update(cfg)
+                # Persist run id alongside outputs for future restarts
+                try:
+                    with open(os.path.join(cfg.output, "wandb_run.id"), "w") as f:
+                        f.write(wandb_logger.id)
+                except Exception as e:
+                    logging.warning("Failed to write wandb_run.id: %s", e)
         except Exception as e:
             print(
                 "WandB Data (Entity and Project name) must be provided in config file (base.py)."
@@ -342,28 +364,76 @@ def main(args):
 
     start_epoch = 0
     global_step = 0
+    # Prepare GradScaler early so we can restore its state if present
+    amp = GradScaler(
+        device=device_type, enabled=(cfg.amp is not None), growth_interval=100
+    )
     if cfg.resume:
-        dict_checkpoint = torch.load(
-            os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt")
-        )
-        start_epoch = dict_checkpoint["epoch"]
-        global_step = dict_checkpoint["global_step"]
-        backbone.module.load_state_dict(dict_checkpoint["state_dict_backbone"])
-        module_partial_fc.load_state_dict(dict_checkpoint["state_dict_softmax_fc"])
-        # restore optimizer and lr scheduler to continue training seamlessly
-        try:
-            opt.load_state_dict(dict_checkpoint["state_optimizer"])
-        except Exception:
-            logging.warning(
-                "state_optimizer not found or incompatible; continuing without optimizer state"
+        checkpoint_path = os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt")
+        if os.path.exists(checkpoint_path):
+            logging.info("Resuming from checkpoint: %s", checkpoint_path)
+            dict_checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            start_epoch = dict_checkpoint.get("epoch", 0)
+            global_step = dict_checkpoint.get("global_step", 0)
+            # Model / module states
+            try:
+                backbone.module.load_state_dict(dict_checkpoint["state_dict_backbone"])
+            except Exception as e:
+                logging.error("Failed to load backbone state_dict: %s", e)
+                raise
+            try:
+                module_partial_fc.load_state_dict(dict_checkpoint["state_dict_softmax_fc"])
+            except Exception as e:
+                logging.error("Failed to load partial FC state_dict: %s", e)
+                raise
+            # Optimizer / LR scheduler
+            state_opt = dict_checkpoint.get("state_optimizer")
+            if state_opt is not None:
+                try:
+                    opt.load_state_dict(state_opt)
+                except Exception as e:
+                    logging.warning("Could not restore optimizer state: %s", e)
+            else:
+                logging.warning("Optimizer state not found in checkpoint.")
+            state_sched = dict_checkpoint.get("state_lr_scheduler")
+            if state_sched is not None:
+                try:
+                    lr_scheduler.load_state_dict(state_sched)
+                except Exception as e:
+                    logging.warning("Could not restore lr_scheduler state: %s", e)
+            else:
+                logging.warning("LR scheduler state not found in checkpoint.")
+            # GradScaler
+            amp_state = dict_checkpoint.get("amp_state")
+            if amp_state and amp.is_enabled():
+                try:
+                    amp.load_state_dict(amp_state)
+                except Exception as e:
+                    logging.warning("Could not restore GradScaler state: %s", e)
+            elif amp.is_enabled():
+                logging.warning("GradScaler state absent; starting fresh scale.")
+            # RNG states (ensure deterministic continuation of sampling order where possible)
+            try:
+                rng_state_torch = dict_checkpoint.get("rng_state_torch")
+                if rng_state_torch is not None:
+                    torch.random.set_rng_state(rng_state_torch)
+                rng_state_cuda = dict_checkpoint.get("rng_state_cuda")
+                if rng_state_cuda is not None and torch.cuda.is_available():
+                    torch.cuda.set_rng_state_all(rng_state_cuda)
+                rng_state_numpy = dict_checkpoint.get("rng_state_numpy")
+                if rng_state_numpy is not None:
+                    np.random.set_state(rng_state_numpy)
+            except Exception as e:
+                logging.warning("Failed to restore RNG states: %s", e)
+            del dict_checkpoint
+            logging.info(
+                "Resumed from epoch %d, global_step %d (AMP scale=%s)",
+                start_epoch,
+                global_step,
+                (amp._get_scale_async() if amp.is_enabled() else "N/A"),
             )
-        try:
-            lr_scheduler.load_state_dict(dict_checkpoint.get("state_lr_scheduler", {}))
-        except Exception:
-            logging.warning(
-                "state_lr_scheduler not found or incompatible; continuing without scheduler state"
-            )
-        del dict_checkpoint
+        else:
+            logging.info("Checkpoint not found at %s, starting from scratch", checkpoint_path)
 
     for key, value in cfg.items():
         num_space = 25 - len(key)
@@ -385,10 +455,7 @@ def main(args):
     )
 
     loss_am = AverageMeter()
-    # Enable GradScaler when AMP dtype is set (also on CPU)
-    amp = GradScaler(
-        device=device_type, enabled=(cfg.amp is not None), growth_interval=100
-    )
+    # (GradScaler already instantiated before resume; keep reference name 'amp')
 
     for epoch in range(start_epoch, cfg.num_epoch):
 
@@ -519,6 +586,12 @@ def main(args):
                 "state_dict_softmax_fc": module_partial_fc.state_dict(),
                 "state_optimizer": opt.state_dict(),
                 "state_lr_scheduler": lr_scheduler.state_dict(),
+                "amp_state": amp.state_dict() if amp.is_enabled() else None,
+                "rng_state_torch": torch.random.get_rng_state(),
+                "rng_state_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                "rng_state_numpy": np.random.get_state(),
+                "wandb_run_id": (wandb_logger.id if wandb_logger else None),
+                "wandb_run_name": (run_name if 'run_name' in locals() else None),
             }
             torch.save(
                 checkpoint, os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt")
@@ -546,6 +619,7 @@ def main(args):
     if rank == 0:
         path_module = os.path.join(cfg.output, "model.pt")
         torch.save(backbone.module.state_dict(), path_module)
+        logging.info("Training finished successfully. Final model saved: %s", path_module)
 
         if wandb_logger and cfg.save_artifacts:
             artifact_name = f"{run_name}_Final"
