@@ -465,25 +465,41 @@ def main(args):
                 sampler.set_epoch(epoch)
         steps_this_epoch = 0
         data_iter = iter(train_loader)
-        while steps_this_epoch < cfg.steps_per_epoch:
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                if cfg.dataset_type != "webdataset":
-                    raise RuntimeError(
-                        f"DataLoader exhausted after {steps_this_epoch} steps, but cfg.steps_per_epoch={cfg.steps_per_epoch}. "
-                        "Adjust num_image/steps_per_epoch or ensure the dataset has enough samples."
-                    )
-                logging.warning(
-                    "Rank %d WebDataset iterator exhausted at epoch %d step %d; retrying new iterator.",
-                    rank,
-                    epoch,
-                    steps_this_epoch,
-                )
-                data_iter = iter(train_loader)
-                continue
+        exhausted = False  # この rank でデータが枯渇したかどうか
 
-            img, local_labels = batch
+        while steps_this_epoch < cfg.steps_per_epoch:
+            if not exhausted:
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    exhausted = True
+                    # cfg.batch_size と image_size に基づくダミーバッチを生成
+                    img = torch.zeros(
+                        cfg.batch_size,
+                        3,
+                        cfg.image_size,
+                        cfg.image_size,
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    local_labels = torch.zeros(
+                        cfg.batch_size,
+                        device=device,
+                        dtype=torch.long,
+                    )
+                    logging.warning(
+                        "Rank %d DataLoader exhausted at epoch %d step %d; "
+                        "using dummy batches until steps_per_epoch=%d",
+                        rank,
+                        epoch,
+                        steps_this_epoch,
+                        cfg.steps_per_epoch,
+                    )
+            if exhausted:
+                # データ枯渇後はダミーバッチでステップ数だけ合わせる（img/local_labels は上で設定済み）
+                pass
+            else:
+                img, local_labels = batch
             steps_this_epoch += 1
             global_step += 1
             # Ensure tensors are on the right device
@@ -497,6 +513,10 @@ def main(args):
                 local_labels = local_labels.to(device)
             local_embeddings = backbone(img)
             loss: torch.Tensor = module_partial_fc(local_embeddings, local_labels)
+
+            # データが尽きた rank は常に loss=0 にして勾配への寄与を無効化
+            if exhausted:
+                loss = loss * 0.0
 
             # 1) 損失のNaN/Inf簡易チェック（シンプルな停止処理）
             if not torch.isfinite(loss):
