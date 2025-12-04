@@ -191,11 +191,12 @@ def main(args):
                 name=run_name,
                 notes=cfg.notes,
             )
-            # If we have a stored run id, resume into that exact run
-            if resume_wandb_id is not None:
+            # If we have a stored run id AND cfg.resume is True, resume into that exact run
+            # Otherwise, always start a fresh run to avoid conflicts with deleted runs
+            if resume_wandb_id is not None and cfg.resume:
                 init_kwargs.update({"id": resume_wandb_id, "resume": "allow"})
-            else:
-                init_kwargs.update({"resume": cfg.wandb_resume})
+            # Do not use cfg.wandb_resume here; it can cause HTTP 409 errors
+            # if the previous run was deleted. Always let wandb generate a new id.
 
             wandb_logger = wandb.init(**init_kwargs) if (rank == 0 or cfg.wandb_log_all) else None
             if wandb_logger:
