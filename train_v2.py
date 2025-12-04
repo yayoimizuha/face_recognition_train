@@ -398,6 +398,11 @@ def main(args):
         device=device_type, enabled=(cfg.amp is not None), growth_interval=100
     )
 
+    # データローダから得られる実バッチのテンソル形状を記憶しておき、
+    # データ枯渇後のダミーバッチ生成に利用する
+    cached_img_shape = None
+    cached_label_shape = None
+
     for epoch in range(start_epoch, cfg.num_epoch):
 
         if isinstance(train_loader, DataLoader):
@@ -415,20 +420,29 @@ def main(args):
                     batch = next(data_iter)
                 except StopIteration:
                     exhausted = True
-                    # cfg.batch_size と image_size に基づくダミーバッチを生成
-                    img = torch.zeros(
-                        cfg.batch_size,
-                        3,
-                        cfg.image_size,
-                        cfg.image_size,
-                        device=device,
-                        dtype=torch.float32,
-                    )
-                    local_labels = torch.zeros(
-                        cfg.batch_size,
-                        device=device,
-                        dtype=torch.long,
-                    )
+                    # これまでに取得した実バッチの形状を利用してダミーバッチを生成
+                    # まだ一度もバッチを取得していない場合は安全にスキップ
+                    if cached_img_shape is not None and cached_label_shape is not None:
+                        img = torch.zeros(
+                            *cached_img_shape,
+                            device=device,
+                            dtype=torch.float32,
+                        )
+                        local_labels = torch.zeros(
+                            *cached_label_shape,
+                            device=device,
+                            dtype=torch.long,
+                        )
+                    else:
+                        logging.warning(
+                            "Rank %d DataLoader exhausted before any batch was received at epoch %d step %d; "
+                            "skipping remaining steps for this epoch (steps_per_epoch=%d)",
+                            rank,
+                            epoch,
+                            steps_this_epoch,
+                            cfg.steps_per_epoch,
+                        )
+                        break
                     logging.warning(
                         "Rank %d DataLoader exhausted at epoch %d step %d; "
                         "using dummy batches until steps_per_epoch=%d",
@@ -442,6 +456,11 @@ def main(args):
                 pass
             else:
                 img, local_labels = batch
+                # 実際に得られたテンソルの形状を記憶
+                if cached_img_shape is None:
+                    cached_img_shape = tuple(img.shape)
+                if cached_label_shape is None:
+                    cached_label_shape = tuple(local_labels.shape)
 
             steps_this_epoch += 1
             global_step += 1
