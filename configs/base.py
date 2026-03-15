@@ -76,9 +76,9 @@ config.wandb_entity = os.environ["WANDB_ENTITY"]
 config.wandb_project = os.environ["WANDB_PROJECT"]
 config.wandb_log_all = True
 config.save_artifacts = False
-config.wandb_resume = False  # resume wandb run: Only if the you wand t resume the last run that it was interrupted
+config.wandb_resume = True  # resume wandb run: Only if the you wand t resume the last run that it was interrupted
 config.notes = "Training various FaceNets with new codebase and dataset and algorithms."
 
 
-config.rec = "/home/apacsc14/Glint360k"
-config.val_dir = "/home/apacsc14/face_valid"
+config.rec = "/tmp/facenet_dataset_tempdir/Glint_360k"
+config.val_dir = "/tmp/facenet_dataset_tempdir/validation"

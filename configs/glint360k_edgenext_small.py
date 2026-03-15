@@ -3,10 +3,10 @@ import torch
 
 config = edict()
 config.margin_list = (1.0, 0.0, 0.4)
-config.network = "edgenext_x_small.in1k"
+config.network = "edgenext_small_rw.sw_in1k"
 config.resume = True
 # 出力先（None だと train_v2.py 内の os.path.join でエラーになるため明示）
-config.output = "./work_dirs/glint360k_edgenext_x_small.in1k"
+config.output = "./work_dirs/glint360k_edgenext_small_rw.sw_in1k"
 config.embedding_size = 512
 config.sample_rate = 1.0
 config.device_type = "cuda"
