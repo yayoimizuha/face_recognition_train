@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
+import kornia.augmentation as K
 from datasets import load_dataset
 from backbones import get_model
 import math
@@ -49,6 +50,10 @@ NUM_WORKERS = 16
 K_FOLDS = 5
 USE_AMP = True  # torch.autocast (混合精度学習)
 USE_COMPILE = True  # torch.compile (PyTorch 2.0+, 初回 epoch にコンパイルコスト発生)
+EMB_DROPOUT = 0.4  # Embedding → ArcFace Head 間の Dropout 率
+RE_P = 0.5  # Random Erasing の適用確率
+RE_SCALE = (0.02, 0.33)  # Random Erasing で消去する面積の割合
+RE_RATIO = (0.3, 3.3)  # Random Erasing の縦横比の範囲
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "work_dirs")
 WANDB_PROJECT = "face-recognition-finetune"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -72,12 +77,27 @@ class HuggingFaceFaceDataset(Dataset):
         return self.transform(img), label
 
 
-transform = transforms.Compose(
+# Kornia Random Erasing: テンソル (C, H, W) を受け取り (C, H, W) を返すラッパー
+_kornia_random_erasing = K.RandomErasing(
+    p=RE_P,
+    scale=RE_SCALE,
+    ratio=RE_RATIO,
+    same_on_batch=False,
+)
+
+
+def _apply_random_erasing(tensor: torch.Tensor) -> torch.Tensor:
+    """(C, H, W) → unsqueeze → Kornia RandomErasing → squeeze して返す"""
+    return _kornia_random_erasing(tensor.unsqueeze(0)).squeeze(0)
+
+
+transform_train = transforms.Compose(
     [
         transforms.Resize((112, 112)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        transforms.Lambda(_apply_random_erasing),
     ]
 )
 
@@ -91,43 +111,97 @@ transform_eval = transforms.Compose(
 
 
 # ──────────────────────────────────────────────
-# ArcFace head (single GPU 版)
+# Face Recognition Model
+# backbone → Dropout → ArcFace Head を 1 クラスに集約
 # ──────────────────────────────────────────────
-class ArcFaceHead(nn.Module):
-    def __init__(self, embedding_size, num_classes, s=64.0, m=0.5):
+class FaceRecognitionModel(nn.Module):
+    """
+    backbone (iResNet 等) + Embedding Dropout + ArcFace Head を一体化したモデル。
+
+    - train forward : embeddings → dropout → arcface logits を返す（loss 計算用）
+    - eval  forward : embeddings（dropout なし）を返す（cos 類似度での推論用）
+    - self.arc_weight プロパティで ArcFace の重みテンソルにアクセス可能
+    """
+
+    def __init__(
+        self,
+        backbone_name: str,
+        emb_size: int,
+        num_classes: int,
+        dropout_p: float = 0.4,
+        arc_s: float = 64.0,
+        arc_m: float = 0.5,
+    ):
         super().__init__()
-        self.s = s
-        self.m = m
-        self.weight = nn.Parameter(torch.FloatTensor(num_classes, embedding_size))
-        nn.init.xavier_uniform_(self.weight)
 
-        self.cos_m = math.cos(m)
-        self.sin_m = math.sin(m)
-        self.th = math.cos(math.pi - m)  # cos(π - m)
-        self.mm = math.sin(math.pi - m) * m
+        # ── backbone ──────────────────────────────
+        self.backbone = get_model(
+            backbone_name, dropout=0.0, amp=None, num_features=emb_size
+        )
 
-    def forward(self, embeddings, labels):
-        # normalize
-        embeddings = F.normalize(embeddings, dim=1)
-        weight = F.normalize(self.weight, dim=1)
+        # ── Embedding Dropout ─────────────────────
+        self.dropout = nn.Dropout(p=dropout_p)
 
-        # fp16 autocast 下では cos_theta が [-1,1] をわずかに超えることがあるため clamp
-        cos_theta = F.linear(embeddings, weight).clamp(
-            -1.0 + 1e-7, 1.0 - 1e-7
-        )  # (B, C)
+        # ── ArcFace Head ──────────────────────────
+        self.arc_s = arc_s
+        self.arc_m = arc_m
+        self.arc_weight = nn.Parameter(torch.FloatTensor(num_classes, emb_size))
+        nn.init.xavier_uniform_(self.arc_weight)
+
+        self._cos_m = math.cos(arc_m)
+        self._sin_m = math.sin(arc_m)
+        self._th = math.cos(math.pi - arc_m)  # cos(π - m)
+        self._mm = math.sin(math.pi - arc_m) * arc_m
+
+    # ------------------------------------------------------------------
+    # embedding: backbone + dropout（train 時のみ dropout が有効）
+    # ------------------------------------------------------------------
+    def embed(self, x: torch.Tensor) -> torch.Tensor:
+        """画像テンソル → L2 正規化前 embedding（dropout 込み）"""
+        return self.dropout(self.backbone(x))
+
+    # ------------------------------------------------------------------
+    # ArcFace logits（train 用）
+    # ------------------------------------------------------------------
+    def arcface_logits(
+        self, embeddings: torch.Tensor, labels: torch.Tensor
+    ) -> torch.Tensor:
+        emb = F.normalize(embeddings, dim=1)
+        w = F.normalize(self.arc_weight, dim=1)
+
+        # fp16 autocast 下では cos_theta が [-1,1] をわずかに超えるため clamp
+        cos_theta = F.linear(emb, w).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
         sin_theta = (1.0 - cos_theta**2).clamp(0, 1).sqrt()
 
-        # cos(θ + m)
-        phi = cos_theta * self.cos_m - sin_theta * self.sin_m
-        # easy-margin 相当: θ > π-m の場合は cos_theta - mm を使う
-        phi = torch.where(cos_theta > self.th, phi, cos_theta - self.mm)
+        phi = cos_theta * self._cos_m - sin_theta * self._sin_m
+        phi = torch.where(cos_theta > self._th, phi, cos_theta - self._mm)
 
         one_hot = torch.zeros_like(cos_theta)
         one_hot.scatter_(1, labels.view(-1, 1), 1.0)
 
-        logits = one_hot * phi + (1.0 - one_hot) * cos_theta
-        logits *= self.s
+        logits = (one_hot * phi + (1.0 - one_hot) * cos_theta) * self.arc_s
         return logits
+
+    # ------------------------------------------------------------------
+    # cos 類似度スコア（val / 推論用、margin なし）
+    # ------------------------------------------------------------------
+    def cos_logits(self, embeddings: torch.Tensor) -> torch.Tensor:
+        emb = F.normalize(embeddings, dim=1)
+        w = F.normalize(self.arc_weight, dim=1)
+        return F.linear(emb, w) * self.arc_s
+
+    # ------------------------------------------------------------------
+    # forward: train → arcface logits, eval → normalized embedding
+    # ------------------------------------------------------------------
+    def forward(
+        self, x: torch.Tensor, labels: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        emb = self.embed(x)
+        if self.training:
+            assert labels is not None, "train モードでは labels が必要です"
+            return self.arcface_logits(emb, labels)
+        else:
+            return self.cos_logits(emb)
 
 
 # ──────────────────────────────────────────────
@@ -158,6 +232,10 @@ def main():
             "arc_m": ARC_M,
             "k_folds": K_FOLDS,
             "use_amp": USE_AMP,
+            "emb_dropout": EMB_DROPOUT,
+            "random_erasing_p": RE_P,
+            "random_erasing_scale": RE_SCALE,
+            "random_erasing_ratio": RE_RATIO,
         },
     )
 
@@ -176,7 +254,7 @@ def main():
     else:
         class_names = [str(i) for i in range(num_classes)]
 
-    full_dataset = HuggingFaceFaceDataset(train_data, transform)
+    full_dataset = HuggingFaceFaceDataset(train_data, transform_train)
     eval_dataset_full = HuggingFaceFaceDataset(train_data, transform_eval)
 
     # K-Fold の index を事前生成（epoch % K_FOLDS 番目の fold を val に使う）
@@ -184,19 +262,22 @@ def main():
     fold_indices = list(kf.split(range(len(full_dataset))))
 
     # Model
-    backbone = get_model(BACKBONE, dropout=0.0, amp=None, num_features=EMB_SIZE).to(
-        DEVICE
-    )
-    head = ArcFaceHead(EMB_SIZE, num_classes, s=ARC_S, m=ARC_M).to(DEVICE)
+    model = FaceRecognitionModel(
+        backbone_name=BACKBONE,
+        emb_size=EMB_SIZE,
+        num_classes=num_classes,
+        dropout_p=EMB_DROPOUT,
+        arc_s=ARC_S,
+        arc_m=ARC_M,
+    ).to(DEVICE)
 
     # torch.compile で TorchDynamo + Inductor による最適化 (PyTorch 2.0+)
     # torch.compile の返り値は nn.Module と互換だが型推論が FunctionType になるため cast する
     if USE_COMPILE:
-        backbone = cast(nn.Module, torch.compile(backbone))
-        head = cast(nn.Module, torch.compile(head))
+        model = cast(nn.Module, torch.compile(model))
 
     optimizer = torch.optim.SGD(
-        [{"params": backbone.parameters()}, {"params": head.parameters()}],
+        model.parameters(),
         lr=LR,
         momentum=0.9,
         weight_decay=WEIGHT_DECAY,
@@ -236,8 +317,7 @@ def main():
         )
 
         # --- train ---
-        backbone.train()
-        head.train()
+        model.train()
 
         total_loss = 0.0
         total_steps = 0
@@ -247,8 +327,7 @@ def main():
             labels = labels.to(DEVICE, non_blocking=True)
 
             with torch.autocast(device_type=DEVICE.type, enabled=USE_AMP):
-                embeddings = backbone(imgs)
-                logits = head(embeddings, labels)
+                logits = model(imgs, labels)
                 loss = criterion(logits, labels)
 
             loss_val = loss.item()
@@ -263,9 +342,7 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                list(backbone.parameters()) + list(head.parameters()), 5.0
-            )
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -282,13 +359,10 @@ def main():
         avg_loss = total_loss / max(total_steps, 1)
 
         # --- val ---
-        backbone.eval()
-        head.eval()
+        model.eval()
         val_loss = 0.0
         val_correct = 0
         val_total = 0
-        # val では labels を ArcFace head に渡さず、cos similarity で分類する
-        weight_norm = F.normalize(head.weight, dim=1)
         with torch.no_grad():
             for imgs, labels in tqdm(
                 val_loader, desc=f"Val   e{epoch} f{fold_idx}", leave=False
@@ -296,9 +370,8 @@ def main():
                 imgs = imgs.to(DEVICE, non_blocking=True)
                 labels = labels.to(DEVICE, non_blocking=True)
                 with torch.autocast(device_type=DEVICE.type, enabled=USE_AMP):
-                    embeddings = backbone(imgs)
-                    emb_norm = F.normalize(embeddings, dim=1)
-                    logits = F.linear(emb_norm, weight_norm) * ARC_S
+                    # eval モードでは model.forward が cos_logits を返す
+                    logits = model(imgs)
                     val_loss += criterion(logits, labels).item()
                 preds = logits.argmax(dim=1)
                 val_correct += (preds == labels).sum().item()
@@ -326,11 +399,9 @@ def main():
             step=(epoch + 1) * len(train_loader),
         )
 
-        torch.save(
-            backbone.state_dict(), os.path.join(run_dir, f"backbone_epoch{epoch}.pt")
-        )
+        torch.save(model.state_dict(), os.path.join(run_dir, f"model_epoch{epoch}.pt"))
 
-    torch.save(backbone.state_dict(), os.path.join(run_dir, "backbone_final.pt"))
+    torch.save(model.state_dict(), os.path.join(run_dir, "model_final.pt"))
     print("Done. Model saved to", run_dir)
 
     # ──────────────────────────────────────────────
@@ -346,17 +417,14 @@ def main():
         pin_memory=True,
     )
 
-    backbone.eval()
+    model.eval()
     all_preds = []
     all_labels = []
     with torch.no_grad():
         for imgs, labels in eval_loader:
             imgs = imgs.to(DEVICE, non_blocking=True)
-            embeddings = backbone(imgs)
-            # ArcFace head の weight を nearest-neighbor 分類器として流用
-            weight = F.normalize(head.weight, dim=1)
-            emb = F.normalize(embeddings, dim=1)
-            logits = F.linear(emb, weight)  # cos similarity → argmax で予測
+            # eval モードでは model.forward が cos_logits を返す
+            logits = model(imgs)
             preds = logits.argmax(dim=1).cpu().numpy()
             all_preds.append(preds)
             all_labels.append(labels.numpy())
