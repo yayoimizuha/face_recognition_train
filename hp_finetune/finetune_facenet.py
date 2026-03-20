@@ -1,6 +1,9 @@
 """
 Fine-tuning script for face recognition using the helloproject-face-webdatasets dataset.
-Single GPU, ArcFace loss, timm ResNet-50 backbone.
+Single GPU, ArcFace loss, MobileNetV4-Hybrid-Medium backbone with GWAP.
+
+Architecture:
+    backbone (timm mobilenetv4_hybrid_medium features) → GWAP → Linear+BN+SiLU+Dropout → Linear → embedding
 
 Usage:
     python hp_finetune/finetune_facenet.py
@@ -24,11 +27,11 @@ import matplotlib_fontja  # noqa: F401 — フォント登録の副作用 import
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
-from backbones import get_model
 from datasets import load_dataset
 from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
 from sklearn.model_selection import StratifiedShuffleSplit
@@ -39,13 +42,18 @@ from tqdm import tqdm
 # ──────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────
-BACKBONE = "timm/resnet50.a1_in1k"
+BACKBONE = "timm/mobilenetv4_hybrid_medium.e500_r224_in1k"
+BACKBONE_DIM = 960  # mobilenetv4_hybrid_medium の forward_features 出力チャンネル数
+HIDDEN_DIM = 1024  # embedding head の中間層次元
 EMB_SIZE = 512
+INPUT_SIZE = 224  # 事前学習時と同じ解像度
+DROPOUT = 0.3  # embedding head の Dropout 率
 NUM_EPOCHS = 200
 BATCH_SIZE = 128
-LR = 2e-3
+LR = 2e-3  # head / GWAP / ArcFace 用
+LR_BACKBONE = 2e-4  # 事前学習済み backbone 用（head の 1/10）
 WEIGHT_DECAY = 5e-4
-ARC_S = 64.0
+ARC_S = 30.0
 ARC_M = 0.5
 NUM_WORKERS = 16
 VAL_RATIO = 0.2  # 学習データの 20% を検証に使用
@@ -54,6 +62,10 @@ USE_COMPILE = True  # torch.compile (PyTorch 2.0+, 初回 epoch にコンパイ�
 SAVE_INTERVAL = 10  # この epoch 間隔でもチェックポイントを保存
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "work_dirs")
 WANDB_PROJECT = "face-recognition-finetune"
+
+# ImageNet 正規化統計量（事前学習済みモデルに合わせる）
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
 # ──────────────────────────────────────────────
@@ -76,40 +88,87 @@ class HuggingFaceFaceDataset(Dataset):
 
 transform_train = transforms.Compose(
     [
-        transforms.Resize((112, 112)),
+        transforms.RandomResizedCrop(INPUT_SIZE, scale=(0.87, 1.0), ratio=(0.8, 1.2)),
         transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+        transforms.RandomAffine(degrees=20, translate=(0.2, 0.2)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        # 適用率・消去範囲を小さめに設定した RandomErasing
-        # p=0.8    : 80% の確率で適用（頻度確認用に引き上げ）
-        # scale    : 消去面積を画像の 2〜10% に制限（デフォルト上限 0.33 より小さい）
-        # value='random': ランダムノイズで埋める。value=0 は Normalize 後の 0.0（グレー）と
-        #                 一致して視覚的変化がなく正則化効果が出ないため使わない。
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        # RandomErasing: 顔の局所特徴を部分的に隠して正則化する
+        # p=0.3  : 30% の確率で適用
+        # scale  : 消去面積を画像の 2〜10% に制限
+        # value='random': ランダムノイズで埋める
         transforms.RandomErasing(
-            p=0.8, scale=(0.10, 0.20), ratio=(0.3, 3.3), value="random"
+            p=0.3, scale=(0.02, 0.10), ratio=(0.3, 3.3), value="random"
         ),
     ]
 )
 
 transform_eval = transforms.Compose(
     [
-        transforms.Resize((112, 112)),
+        transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ]
 )
 
 
 # ──────────────────────────────────────────────
+# Global Weighted Average Pooling (GWAP)
+# Qiu, "Global Weighted Average Pooling Bridges
+#  Pixel-level Localization and Image-level Classification"
+# class-agnostic 版 (Section 3.2, Eq.5–8)
+# ──────────────────────────────────────────────
+class GWAP(nn.Module):
+    """Class-agnostic Global Weighted Average Pooling.
+
+    特徴マップ F ∈ (B, C, H, W) に対して、空間位置ごとの重要度スコアを
+    学習可能な 1×1 conv → sigmoid → exp で生成し、空間方向に正規化した
+    重みで加重平均を取る。出力は (B, C)。
+
+    数式:
+        M(x,y) = exp(σ(w · F(x,y) + b))       ... Eq.5
+        α(x,y) = M(x,y) / Σ_{x,y} M(x,y)     ... Eq.6
+        f = Σ_{x,y} α(x,y) · F(x,y)           ... Eq.8
+    """
+
+    def __init__(self, in_channels: int):
+        super().__init__()
+        # 1×1 conv: (B, C, H, W) → (B, 1, H, W)
+        self.score_conv = nn.Conv2d(in_channels, 1, kernel_size=1, bias=True)
+        nn.init.xavier_uniform_(self.score_conv.weight)
+        nn.init.zeros_(self.score_conv.bias)  # type: ignore[arg-type]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, C, H, W) → (B, C)"""
+        # score: (B, 1, H, W)
+        score = self.score_conv(x)
+        # M(x,y) = exp(sigmoid(score))
+        m = torch.exp(torch.sigmoid(score))  # (B, 1, H, W), 値域 [e^0, e^1] = [1, e]
+        # α = M / Σ M (空間方向の正規化)
+        alpha = m / m.sum(dim=(2, 3), keepdim=True)  # (B, 1, H, W)
+        # 加重平均: (B, C, H, W) * (B, 1, H, W) → sum → (B, C)
+        out = (x * alpha).sum(dim=(2, 3))
+        return out
+
+
+# ──────────────────────────────────────────────
 # Face Recognition Model
-# backbone → ArcFace Head を 1 クラスに集約
+# backbone (timm MobileNetV4) + GWAP + Head + ArcFace
 # ──────────────────────────────────────────────
 class FaceRecognitionModel(nn.Module):
     """
-    backbone (timm ResNet 等) + ArcFace Head を一体化したモデル。
+    backbone (timm MobileNetV4-Hybrid-Medium features) + GWAP + embedding head
+    + ArcFace Head を一体化したモデル。
+
+    構造:
+        backbone.forward_features(x) → (B, 960, H, W)
+        GWAP                         → (B, 960)
+        Linear(960, 1024)            → BN(1024) → SiLU → Dropout
+        Linear(1024, 512)            → embedding (B, 512)
 
     公開メソッド:
-        embed(x)           → embedding (backbone の出力そのまま)
+        embed(x)           → embedding (backbone + GWAP + head)
         arcface_logits(e,l) → ArcFace margin 付き logits (loss 計算用)
         cos_logits(e)      → margin なしの cosine logits (推論・val 用)
 
@@ -125,17 +184,35 @@ class FaceRecognitionModel(nn.Module):
     def __init__(
         self,
         backbone_name: str,
+        backbone_dim: int,
+        hidden_dim: int,
         emb_size: int,
         num_classes: int,
+        dropout: float = 0.4,
         arc_s: float = 64.0,
         arc_m: float = 0.5,
     ):
         super().__init__()
 
         # ── backbone ──────────────────────────────
-        # amp=None: backbone 内部の autocast を無効化し、外側の autocast に委譲する
-        self.backbone = get_model(
-            backbone_name, dropout=0.0, amp=None, num_features=emb_size
+        # timm の分類ヘッド (conv_head, norm_head, classifier) を除去し、
+        # forward_features のみ使う (出力: B, backbone_dim, H, W)
+        timm_name = backbone_name.removeprefix("timm/")
+        self.backbone = timm.create_model(timm_name, pretrained=True, num_classes=0)
+        # num_classes=0 にすると classifier は Identity になるが、
+        # MobileNetV3 系は conv_head/norm_head がまだ残る。
+        # forward_features() を使えば conv_head の前で止まる。
+
+        # ── GWAP ──────────────────────────────────
+        self.gwap = GWAP(backbone_dim)
+
+        # ── Embedding Head ────────────────────────
+        self.head = nn.Sequential(
+            nn.Linear(backbone_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, emb_size),
         )
 
         # ── ArcFace Head ──────────────────────────
@@ -150,11 +227,13 @@ class FaceRecognitionModel(nn.Module):
         self._mm = math.sin(math.pi - arc_m) * arc_m
 
     # ------------------------------------------------------------------
-    # embedding: backbone の出力
+    # embedding: backbone + GWAP + head
     # ------------------------------------------------------------------
     def embed(self, x: torch.Tensor) -> torch.Tensor:
         """画像テンソル → embedding"""
-        return self.backbone(x)
+        feat = self.backbone.forward_features(x)  # (B, 960, H, W)
+        pooled = self.gwap(feat)  # (B, 960)
+        return self.head(pooled)  # (B, emb_size)
 
     # ------------------------------------------------------------------
     # ArcFace logits（train 用 — margin 付き）
@@ -215,7 +294,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 固定入力サイズ (112x112) に最適な cuDNN カーネルを自動選択
+    # 固定入力サイズ (224x224) に最適な cuDNN カーネルを自動選択
     torch.backends.cudnn.benchmark = True
 
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -230,15 +309,22 @@ def main():
         name=f"run_{run_timestamp}",
         config={
             "backbone": BACKBONE,
+            "backbone_dim": BACKBONE_DIM,
+            "hidden_dim": HIDDEN_DIM,
             "emb_size": EMB_SIZE,
+            "input_size": INPUT_SIZE,
+            "dropout": DROPOUT,
             "num_epochs": NUM_EPOCHS,
             "batch_size": BATCH_SIZE,
             "lr": LR,
+            "lr_backbone": LR_BACKBONE,
             "weight_decay": WEIGHT_DECAY,
             "arc_s": ARC_S,
             "arc_m": ARC_M,
             "val_ratio": VAL_RATIO,
             "use_amp": USE_AMP,
+            "pooling": "GWAP",
+            "scheduler": "CosineAnnealingLR",
         },
     )
 
@@ -300,8 +386,10 @@ def main():
             fig, axes = plt.subplots(GRID_N, GRID_N, figsize=(16, 16))
             for i, (img, label) in enumerate(zip(imgs, labels)):
                 ax = axes[i // GRID_N][i % GRID_N]
-                # 逆 Normalize: tensor in [-1,1] → [0,1]
-                img_np = (img.permute(1, 2, 0).numpy() * 0.5 + 0.5).clip(0.0, 1.0)
+                # 逆 Normalize: ImageNet stats を元に戻す
+                mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
+                std = torch.tensor(IMAGENET_STD).view(3, 1, 1)
+                img_np = ((img * std + mean).permute(1, 2, 0).numpy()).clip(0.0, 1.0)
                 ax.imshow(img_np)
                 ax.set_title(class_names[label.item()], fontsize=8)
                 ax.axis("off")
@@ -324,8 +412,11 @@ def main():
     # ことがあるため、compile 前のモデル参照を保持して保存に使う。
     model = FaceRecognitionModel(
         backbone_name=BACKBONE,
+        backbone_dim=BACKBONE_DIM,
+        hidden_dim=HIDDEN_DIM,
         emb_size=EMB_SIZE,
         num_classes=num_classes,
+        dropout=DROPOUT,
         arc_s=ARC_S,
         arc_m=ARC_M,
     ).to(device)
@@ -334,20 +425,28 @@ def main():
     if USE_COMPILE:
         model = cast(nn.Module, torch.compile(model))
 
+    # ── Optimizer: backbone と head/GWAP/ArcFace で学習率を分ける ──
+    # NOTE: model_to_save (compile 前) からパラメータを取得する。
+    # torch.compile 後の model.parameters() は同じテンソルを返すが、
+    # 一貫性のため compile 前の参照を使う。
+    backbone_params = list(model_to_save.backbone.parameters())
+    backbone_param_ids = {id(p) for p in backbone_params}
+    head_params = [
+        p for p in model_to_save.parameters() if id(p) not in backbone_param_ids
+    ]
+
     optimizer = torch.optim.SGD(
-        model.parameters(),
-        lr=LR,
+        [
+            {"params": backbone_params, "lr": LR_BACKBONE},
+            {"params": head_params, "lr": LR},
+        ],
         momentum=0.9,
         weight_decay=WEIGHT_DECAY,
     )
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        milestones=[
-            int(NUM_EPOCHS * 0.6),
-            int(NUM_EPOCHS * 0.75),
-            int(NUM_EPOCHS * 0.9),
-        ],
-        gamma=0.7,
+        T_max=NUM_EPOCHS,
+        eta_min=1e-6,
     )
     criterion = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler(device.type, enabled=USE_AMP, init_scale=2048.0)
@@ -370,7 +469,9 @@ def main():
 
             with torch.autocast(device_type=device.type, enabled=USE_AMP):
                 logits = model(imgs, labels)
-                loss = criterion(logits, labels)
+                # ArcFace スケール付き logits は fp16 だと exp() がオーバーフロー
+                # するため、CrossEntropy の入力は fp32 にキャストする。
+                loss = criterion(logits.float(), labels)
 
             # nan/inf 時は zero_grad して continue するだけ。
             # scaler.update() を backward() なしで呼ぶと内部状態が壊れる。
@@ -409,7 +510,7 @@ def main():
         # ArcFace の margin がないため train loss より低くなるのが正常。
         # 絶対値を比較するのではなく、epoch 間の val loss/acc の推移で判断する。
         model.eval()
-        val_loss_sum = torch.tensor(0.0, device=device)
+        val_loss_sum = 0.0
         val_correct = 0
         val_total = 0
         with torch.no_grad():
@@ -418,12 +519,16 @@ def main():
                 labels = labels.to(device, non_blocking=True)
                 with torch.autocast(device_type=device.type, enabled=USE_AMP):
                     logits = model(imgs)
-                    val_loss_sum += criterion(logits, labels)
+                # ArcFace スケール (arc_s) 付きの logits は値域が大きく
+                # fp16 のまま CrossEntropy に渡すと exp() がオーバーフローする。
+                # fp32 にキャストしてから loss を計算する。
+                loss = criterion(logits.float(), labels)
+                val_loss_sum += loss.item()
                 preds = logits.argmax(dim=1)
                 val_correct += (preds == labels).sum().item()
                 val_total += labels.size(0)
 
-        avg_val_loss = val_loss_sum.item() / len(val_loader)
+        avg_val_loss = val_loss_sum / len(val_loader)
         val_acc = val_correct / val_total
 
         epoch_bar.set_postfix(
