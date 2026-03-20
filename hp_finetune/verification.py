@@ -15,8 +15,7 @@ import numpy as np
 import onnxruntime as ort
 from tqdm import tqdm
 
-from hp_finetune.data_utils import load_eval_samples
-from hp_finetune.finetune_facenet import INPUT_SIZE
+from hp_finetune.data_utils import ImageConfig, load_eval_samples
 
 # ──────────────────────────────────────────────
 # Constants
@@ -34,6 +33,7 @@ DEFAULT_EVAL_SAMPLES = 50
 def verify_dynamic_batch(
     onnx_path: str,
     *,
+    input_size: int,
     num_classes: int,
     rng: np.random.Generator | None = None,
     label: str = "",
@@ -51,7 +51,7 @@ def verify_dynamic_batch(
         )
     ]
     for bs in batch_sizes:
-        test_in = np.random.randn(bs, 3, INPUT_SIZE, INPUT_SIZE).astype(np.float32)
+        test_in = np.random.randn(bs, 3, input_size, input_size).astype(np.float32)
         out = sess.run(None, {"input": test_in})[0]
         assert out.shape == (bs, num_classes), (
             f"{label} batch={bs}: expected ({bs}, {num_classes}), got {out.shape}"
@@ -94,6 +94,7 @@ def evaluate_model_quality(
     fp32_path: str,
     target_path: str,
     *,
+    img_cfg: ImageConfig,
     num_samples: int = DEFAULT_EVAL_SAMPLES,
     label: str = "target",
 ) -> None:
@@ -106,7 +107,7 @@ def evaluate_model_quality(
     print(f"Quality evaluation: fp32 vs {label} ({num_samples} real samples)")
     print(f"{'=' * 60}")
 
-    samples = load_eval_samples(num_samples)
+    samples = load_eval_samples(img_cfg, num_samples)
     if not samples:
         print("  [WARN] No evaluation samples available, skipping.")
         return

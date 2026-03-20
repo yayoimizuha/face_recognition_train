@@ -2,16 +2,19 @@
 
 Centralises dataset access, image transforms, and sample preparation so that
 calibration, evaluation, and single-image verification share one code path.
+
+All image-processing parameters (input_size, mean, std) are passed explicitly
+rather than imported from a global config, so this module is backbone-agnostic.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
 from onnxruntime.quantization import CalibrationDataReader
 from torchvision import transforms
 from tqdm import tqdm
-
-from hp_finetune.finetune_facenet import IMAGENET_MEAN, IMAGENET_STD, INPUT_SIZE
 
 # ──────────────────────────────────────────────
 # Constants
@@ -22,15 +25,27 @@ DEFAULT_EVAL_SAMPLES = 50
 
 
 # ──────────────────────────────────────────────
+# Image preprocessing config
+# ──────────────────────────────────────────────
+@dataclass(frozen=True)
+class ImageConfig:
+    """Holds all image-preprocessing parameters needed for ONNX inference."""
+
+    input_size: int
+    mean: list[float]
+    std: list[float]
+
+
+# ──────────────────────────────────────────────
 # Shared transform
 # ──────────────────────────────────────────────
-def get_inference_transform() -> transforms.Compose:
+def get_inference_transform(cfg: ImageConfig) -> transforms.Compose:
     """Return the canonical image transform used for ONNX inference."""
     return transforms.Compose(
         [
-            transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
+            transforms.Resize((cfg.input_size, cfg.input_size)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            transforms.Normalize(mean=cfg.mean, std=cfg.std),
         ]
     )
 
@@ -59,23 +74,28 @@ def get_class_names_from_dataset() -> list[str]:
 
 
 # ──────────────────────────────────────────────
-# Real-image sample (cached singleton)
+# Real-image sample (cached per ImageConfig)
 # ──────────────────────────────────────────────
-_REAL_SAMPLE_CACHE: np.ndarray | None = None
+_REAL_SAMPLE_CACHE: dict[tuple, np.ndarray] = {}
 
 
-def get_real_sample() -> np.ndarray:
-    """Load a single real image as ``(1, 3, H, W)`` float32 ndarray (cached)."""
-    global _REAL_SAMPLE_CACHE
-    if _REAL_SAMPLE_CACHE is not None:
-        return _REAL_SAMPLE_CACHE
+def get_real_sample(cfg: ImageConfig) -> np.ndarray:
+    """Load a single real image as ``(1, 3, H, W)`` float32 ndarray (cached).
 
-    transform = get_inference_transform()
+    The cache is keyed by ``(input_size, mean, std)`` so that different
+    :class:`ImageConfig` values produce separate cached samples.
+    """
+    key = (cfg.input_size, tuple(cfg.mean), tuple(cfg.std))
+    if key in _REAL_SAMPLE_CACHE:
+        return _REAL_SAMPLE_CACHE[key]
+
+    transform = get_inference_transform(cfg)
     dataset = load_train_dataset()
     item = dataset[0]
     img = item["image"].convert("RGB")
-    _REAL_SAMPLE_CACHE = transform(img).unsqueeze(0).numpy().astype(np.float32)
-    return _REAL_SAMPLE_CACHE
+    sample = transform(img).unsqueeze(0).numpy().astype(np.float32)
+    _REAL_SAMPLE_CACHE[key] = sample
+    return sample
 
 
 # ──────────────────────────────────────────────
@@ -88,8 +108,12 @@ class FaceCalibrationDataReader(CalibrationDataReader):
     seed for reproducibility.
     """
 
-    def __init__(self, num_samples: int = DEFAULT_CALIB_SAMPLES):
-        transform = get_inference_transform()
+    def __init__(
+        self,
+        cfg: ImageConfig,
+        num_samples: int = DEFAULT_CALIB_SAMPLES,
+    ):
+        transform = get_inference_transform(cfg)
 
         print("Loading calibration dataset...")
         dataset = load_train_dataset()
@@ -122,6 +146,7 @@ class FaceCalibrationDataReader(CalibrationDataReader):
 # Evaluation data loader
 # ──────────────────────────────────────────────
 def load_eval_samples(
+    cfg: ImageConfig,
     num_samples: int,
     *,
     calib_seed: int = 42,
@@ -130,7 +155,7 @@ def load_eval_samples(
 
     Uses a different RNG seed to avoid overlap with calibration indices.
     """
-    transform = get_inference_transform()
+    transform = get_inference_transform(cfg)
 
     print("  Loading evaluation dataset...")
     dataset = load_train_dataset()

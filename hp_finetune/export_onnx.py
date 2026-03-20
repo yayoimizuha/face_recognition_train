@@ -34,6 +34,7 @@ fp16 / bf16 notes:
 import argparse
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -45,6 +46,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from onnxconverter_common import float16 as onnx_float16
 from onnxruntime.quantization import (
+    CalibrationDataReader,
     CalibrationMethod,
     QuantFormat,
     QuantType,
@@ -52,21 +54,16 @@ from onnxruntime.quantization import (
 )
 from onnxruntime.quantization.shape_inference import quant_pre_process
 
+from hp_finetune.config_loader import RunConfig, load_run_config
 from hp_finetune.data_utils import (
     DEFAULT_CALIB_SAMPLES,
     DEFAULT_EVAL_SAMPLES,
     FaceCalibrationDataReader,
+    ImageConfig,
     get_class_names_from_dataset,
     get_real_sample,
 )
-from hp_finetune.finetune_facenet import (
-    BACKBONE,
-    BACKBONE_DIM,
-    EMB_SIZE,
-    HIDDEN_DIM,
-    INPUT_SIZE,
-    FaceRecognitionModel,
-)
+from hp_finetune.finetune_facenet import FaceRecognitionModel
 from hp_finetune.onnx_graph_utils import (
     embed_class_metadata,
     fix_hardcoded_batch_in_reshapes,
@@ -105,6 +102,11 @@ _RESIDUAL_DTYPE_MAP: dict[str, TargetDtype] = {
     "fp16": TargetDtype.FP16,
     "bf16": TargetDtype.BF16,
 }
+
+# 動的感度検出のしきい値。
+# 1ノードを INT8 量子化したときの fp32 との最大絶対差がこの値を超えたら
+# そのノードを除外候補とみなす。
+_SENSITIVITY_DIFF_THRESHOLD = 0.5
 
 
 # ──────────────────────────────────────────────
@@ -175,17 +177,19 @@ def _detect_num_classes(state_dict: dict, num_classes_arg: int | None) -> int:
 
 
 def load_classification_model(
-    checkpoint_path: str, num_classes: int
+    checkpoint_path: str,
+    num_classes: int | None,
+    run_cfg: RunConfig,
 ) -> ClassificationModel:
     """Load a checkpoint and return the inference-ready classification model."""
     state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     detected_num_classes = _detect_num_classes(state_dict, num_classes)
 
     full_model = FaceRecognitionModel(
-        backbone_name=BACKBONE,
-        backbone_dim=BACKBONE_DIM,
-        hidden_dim=HIDDEN_DIM,
-        emb_size=EMB_SIZE,
+        backbone_name=run_cfg.backbone,
+        backbone_dim=run_cfg.backbone_dim,
+        hidden_dim=run_cfg.hidden_dim,
+        emb_size=run_cfg.emb_size,
         num_classes=detected_num_classes,
     )
     full_model.load_state_dict(state_dict)
@@ -197,36 +201,134 @@ def load_classification_model(
 
 
 # ──────────────────────────────────────────────
-# INT8 sensitive node detection
+# INT8 sensitive node detection (dynamic, output-difference based)
 # ──────────────────────────────────────────────
-def _find_sensitive_nodes(preprocessed_path: str) -> list[str]:
+class _SensitivityProbeReader(CalibrationDataReader):
+    """Lightweight :class:`CalibrationDataReader` backed by a pre-built sample list.
+
+    Used internally by :func:`_find_sensitive_nodes` to probe one Conv/Gemm
+    node at a time without reloading data from disk.
+    """
+
+    def __init__(self, samples: list[np.ndarray]):
+        self._samples = samples
+        self._iter = iter(self._samples)
+
+    def get_next(self) -> dict[str, np.ndarray] | None:
+        try:
+            return {"input": next(self._iter)}
+        except StopIteration:
+            return None
+
+    def rewind(self) -> None:
+        self._iter = iter(self._samples)
+
+
+def _find_sensitive_nodes(
+    preprocessed_path: str,
+    img_cfg: ImageConfig,
+    calib_samples: list[np.ndarray],
+    *,
+    threshold: float = _SENSITIVITY_DIFF_THRESHOLD,
+) -> list[str]:
     """Identify Conv/Gemm nodes that degrade badly under INT8 quantization.
 
-    Sensitive categories:
-    1. Depthwise Conv (dw_start, dw_mid) -- single-filter-per-channel
-    2. ConvMulFusion (BN-folded Conv) -- extreme quantization scales
-    3. Gemm (embedding head + arc_weight cosine) -- amplified by L2 norm
-    4. GWAP score_conv -- feeds exp(sigmoid(score)) chain
+    For each Conv/Gemm node, a temporary model is quantized with *only that
+    node* included in quantization.  A few calibration samples are run through
+    both the fp32 base and the single-node-quantized model; if the maximum
+    absolute output difference exceeds *threshold*, the node is flagged as
+    sensitive and will be excluded from the full quantization pass.
+
+    This approach is architecture-agnostic: it does not rely on MobileNetV4-
+    specific node name patterns.
+
+    Args:
+        preprocessed_path: Path to the pre-processed (shape-inferred) fp32 ONNX.
+        img_cfg: Image config (used only for shape information in error messages).
+        calib_samples: Small list of calibration numpy arrays ``(1,3,H,W)``.
+        threshold: Max-abs-diff threshold above which a node is sensitive.
+
+    Returns:
+        List of node names to exclude from quantization.
     """
     model = onnx.load(preprocessed_path)
+    candidate_nodes = [
+        node
+        for node in model.graph.node
+        if node.op_type in ("Conv", "Gemm") and node.name
+    ]
+
+    if not candidate_nodes:
+        return []
+
+    print(
+        f"  Sensitivity scan: testing {len(candidate_nodes)} Conv/Gemm nodes "
+        f"with {len(calib_samples)} samples (threshold={threshold})..."
+    )
+
+    # fp32 baseline outputs
+    sess_fp32 = ort.InferenceSession(preprocessed_path)
+    fp32_outputs = [sess_fp32.run(None, {"input": s})[0] for s in calib_samples]
+
     sensitive: list[str] = []
 
-    for node in model.graph.node:
-        if node.op_type not in ("Conv", "Gemm"):
-            continue
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for node in candidate_nodes:
+            node_name = node.name
+            tmp_path = os.path.join(tmp_dir, "single_node_quant.onnx")
 
-        weight_name = node.input[1] if len(node.input) > 1 else ""
-        is_sensitive = (
-            "dw_start" in weight_name
-            or "dw_mid" in weight_name
-            or "ConvMulFusion" in weight_name
-            or node.op_type == "Gemm"
-            or "score_conv" in weight_name
-            or "conv2d" in node.name
-        )
-        if is_sensitive:
-            sensitive.append(node.name)
+            # Minimal CalibrationDataReader for a single-node quantization probe
+            probe_reader = _SensitivityProbeReader(calib_samples)
 
+            try:
+                quantize_static(
+                    model_input=preprocessed_path,
+                    model_output=tmp_path,
+                    calibration_data_reader=probe_reader,
+                    quant_format=QuantFormat.QDQ,
+                    activation_type=QuantType.QUInt8,
+                    weight_type=QuantType.QInt8,
+                    per_channel=True,
+                    reduce_range=False,
+                    op_types_to_quantize=["Conv", "Gemm"],
+                    nodes_to_quantize=[node_name],
+                    calibrate_method=CalibrationMethod.MinMax,
+                    extra_options={
+                        "ActivationSymmetric": False,
+                        "WeightSymmetric": True,
+                    },
+                )
+            except Exception as e:
+                # If quantizing this single node fails outright, exclude it
+                print(f"    [{node_name}] quantization failed ({e!s:.80}), excluding")
+                sensitive.append(node_name)
+                continue
+
+            try:
+                sess_q = ort.InferenceSession(tmp_path)
+                max_diff = max(
+                    float(
+                        np.max(
+                            np.abs(fp32_outputs[i] - sess_q.run(None, {"input": s})[0])
+                        )
+                    )
+                    for i, s in enumerate(calib_samples)
+                )
+            except Exception as e:
+                print(f"    [{node_name}] inference failed ({e!s:.80}), excluding")
+                sensitive.append(node_name)
+                continue
+
+            if max_diff > threshold:
+                print(
+                    f"    [{node_name}] sensitive  max_diff={max_diff:.4f} > {threshold}"
+                )
+                sensitive.append(node_name)
+
+    print(
+        f"  Sensitivity scan complete: "
+        f"{len(sensitive)}/{len(candidate_nodes)} nodes excluded"
+    )
     return sensitive
 
 
@@ -238,12 +340,13 @@ def export_fp32_onnx(
     onnx_path: str,
     opset: int,
     *,
+    img_cfg: ImageConfig,
     num_classes: int,
     class_names: list[str],
 ) -> None:
     """Export PyTorch model to fp32 ONNX with dynamic batch and metadata."""
     print(f"Exporting fp32 ONNX to: {onnx_path}")
-    dummy_input = torch.randn(1, 3, INPUT_SIZE, INPUT_SIZE)
+    dummy_input = torch.randn(1, 3, img_cfg.input_size, img_cfg.input_size)
 
     torch.onnx.export(
         cls_model,
@@ -263,7 +366,12 @@ def export_fp32_onnx(
     # Fix hardcoded batch dims in Reshape nodes
     print("  Fixing hardcoded batch dimension in Reshape nodes...")
     onnx_model = onnx.load(onnx_path)
-    fix_hardcoded_batch_in_reshapes(onnx_model, onnx_path, rng=np.random.default_rng(0))
+    fix_hardcoded_batch_in_reshapes(
+        onnx_model,
+        onnx_path,
+        input_size=img_cfg.input_size,
+        rng=np.random.default_rng(0),
+    )
 
     # Make graph I/O batch dim symbolic
     onnx_model = onnx.load(onnx_path)
@@ -273,7 +381,11 @@ def export_fp32_onnx(
     # Verify
     print("  Verifying dynamic batch with random batch sizes...")
     verify_dynamic_batch(
-        onnx_path, num_classes=num_classes, rng=np.random.default_rng(0), label="fp32"
+        onnx_path,
+        input_size=img_cfg.input_size,
+        num_classes=num_classes,
+        rng=np.random.default_rng(0),
+        label="fp32",
     )
 
     onnx_model = onnx.load(onnx_path)
@@ -287,7 +399,7 @@ def export_fp32_onnx(
 
     # Verify output vs PyTorch (single real image)
     print("Verifying fp32 ONNX output vs PyTorch (real image)...")
-    real_sample = get_real_sample()
+    real_sample = get_real_sample(img_cfg)
     real_tensor = torch.from_numpy(real_sample)
     with torch.no_grad():
         pt_out = cls_model(real_tensor).numpy()
@@ -303,6 +415,7 @@ def export_fp16_onnx(
     fp32_path: str,
     fp16_path: str,
     *,
+    img_cfg: ImageConfig,
     num_classes: int,
     class_names: list[str],
 ) -> None:
@@ -325,7 +438,11 @@ def export_fp16_onnx(
 
     print("  Verifying fp16 dynamic batch...")
     verify_dynamic_batch(
-        fp16_path, num_classes=num_classes, rng=np.random.default_rng(2), label="fp16"
+        fp16_path,
+        input_size=img_cfg.input_size,
+        num_classes=num_classes,
+        rng=np.random.default_rng(2),
+        label="fp16",
     )
     print(f"  fp16 ONNX saved: {fp16_path}")
 
@@ -337,6 +454,7 @@ def export_bf16_onnx(
     fp32_path: str,
     bf16_path: str,
     *,
+    img_cfg: ImageConfig,
     num_classes: int,
     class_names: list[str],
 ) -> None:
@@ -360,7 +478,11 @@ def export_bf16_onnx(
 
     print("  Verifying bf16 dynamic batch...")
     verify_dynamic_batch(
-        bf16_path, num_classes=num_classes, rng=np.random.default_rng(3), label="bf16"
+        bf16_path,
+        input_size=img_cfg.input_size,
+        num_classes=num_classes,
+        rng=np.random.default_rng(3),
+        label="bf16",
     )
     print(f"  bf16 ONNX saved: {bf16_path}")
 
@@ -373,14 +495,17 @@ def export_int8_onnx(
     int8_path: str,
     calib_samples: int,
     *,
+    img_cfg: ImageConfig,
     num_classes: int,
     class_names: list[str],
     residual_dtype: str = "fp16",
 ) -> None:
     """Produce an INT8 statically-quantized model from the fp32 base.
 
-    Sensitive Conv/Gemm nodes are excluded from quantization.  Residual
-    (non-quantized) weights are compressed to *residual_dtype* ("fp16"/"bf16").
+    Sensitive Conv/Gemm nodes are detected dynamically by comparing per-node
+    INT8 output against fp32; nodes with large divergence are excluded.
+    Residual (non-quantized) weights are compressed to *residual_dtype*
+    ("fp16"/"bf16").
     """
     label = f"INT8+{residual_dtype}"
     print(f"Running {label} quantization with calibration...")
@@ -396,11 +521,19 @@ def export_int8_onnx(
         skip_symbolic_shape=True,
     )
 
-    # Identify sensitive nodes to exclude
-    nodes_to_exclude = _find_sensitive_nodes(preprocessed_path)
+    # Build calibration data (reused for sensitivity scan + quantization)
+    calib_reader = FaceCalibrationDataReader(img_cfg, num_samples=calib_samples)
+    probe_samples = calib_reader.samples[: min(8, len(calib_reader.samples))]
+
+    # Identify sensitive nodes dynamically via output-difference comparison
+    nodes_to_exclude = _find_sensitive_nodes(
+        preprocessed_path,
+        img_cfg,
+        probe_samples,
+    )
     print(f"  Excluding {len(nodes_to_exclude)} sensitive nodes from quantization")
 
-    calib_reader = FaceCalibrationDataReader(num_samples=calib_samples)
+    calib_reader.rewind()
     quantize_static(
         model_input=preprocessed_path,
         model_output=int8_path,
@@ -429,7 +562,11 @@ def export_int8_onnx(
 
     print(f"  Fixing {label} model batch dimensions...")
     fix_hardcoded_batch_in_reshapes(
-        onnx_int8_model, int8_path, rng=np.random.default_rng(1), label=label
+        onnx_int8_model,
+        int8_path,
+        input_size=img_cfg.input_size,
+        rng=np.random.default_rng(1),
+        label=label,
     )
     make_batch_dim_dynamic(onnx_int8_model)
 
@@ -447,13 +584,17 @@ def export_int8_onnx(
     # Verify
     print(f"  Verifying {label} dynamic batch with random batch sizes...")
     verify_dynamic_batch(
-        int8_path, num_classes=num_classes, rng=np.random.default_rng(1), label=label
+        int8_path,
+        input_size=img_cfg.input_size,
+        num_classes=num_classes,
+        rng=np.random.default_rng(1),
+        label=label,
     )
     print(f"  {label} ONNX model saved and verified: {int8_path}")
 
     # Quick output quality check (single real image)
     print(f"Verifying {label} ONNX output vs fp32 ONNX (real image, logits)...")
-    real_sample = get_real_sample()
+    real_sample = get_real_sample(img_cfg)
     sess_fp32 = ort.InferenceSession(fp32_path)
     sess_int8 = ort.InferenceSession(int8_path)
     fp32_out = sess_fp32.run(None, {"input": real_sample})[0]
@@ -515,6 +656,21 @@ def main():
         print(f"Error: checkpoint not found: {checkpoint_path}")
         sys.exit(1)
 
+    # Load architecture constants from the saved finetune_facenet.py copy
+    print(f"Loading run config from saved script next to checkpoint...")
+    run_cfg = load_run_config(checkpoint_path)
+    print(
+        f"  backbone={run_cfg.backbone}  input_size={run_cfg.input_size}  "
+        f"emb_size={run_cfg.emb_size}  backbone_dim={run_cfg.backbone_dim}"
+    )
+
+    # Build ImageConfig for preprocessing / verification
+    img_cfg = ImageConfig(
+        input_size=run_cfg.input_size,
+        mean=run_cfg.imagenet_mean,
+        std=run_cfg.imagenet_std,
+    )
+
     out_dir = os.path.dirname(checkpoint_path) or "."
     stem = os.path.splitext(os.path.basename(checkpoint_path))[0]
 
@@ -536,22 +692,25 @@ def main():
 
     # Step 2: Load model
     print(f"Loading checkpoint: {checkpoint_path}")
-    cls_model = load_classification_model(checkpoint_path, args.num_classes)
+    cls_model = load_classification_model(checkpoint_path, args.num_classes, run_cfg)
 
     # Step 3: fp32 ONNX (base -- other variants derive from this)
-    export_fp32_onnx(cls_model, paths["fp32"], opset=args.opset, **meta)
+    export_fp32_onnx(
+        cls_model, paths["fp32"], opset=args.opset, img_cfg=img_cfg, **meta
+    )
 
     # Step 4: fp16 full conversion
-    export_fp16_onnx(paths["fp32"], paths["fp16"], **meta)
+    export_fp16_onnx(paths["fp32"], paths["fp16"], img_cfg=img_cfg, **meta)
 
     # Step 5: bf16 full conversion
-    export_bf16_onnx(paths["fp32"], paths["bf16"], **meta)
+    export_bf16_onnx(paths["fp32"], paths["bf16"], img_cfg=img_cfg, **meta)
 
     # Step 6: fp16+INT8 quantization
     export_int8_onnx(
         paths["fp32"],
         paths["fp16int8"],
         calib_samples=args.calib_samples,
+        img_cfg=img_cfg,
         residual_dtype="fp16",
         **meta,
     )
@@ -561,6 +720,7 @@ def main():
         paths["fp32"],
         paths["bf16int8"],
         calib_samples=args.calib_samples,
+        img_cfg=img_cfg,
         residual_dtype="bf16",
         **meta,
     )
@@ -570,6 +730,7 @@ def main():
         evaluate_model_quality(
             paths["fp32"],
             paths[label],
+            img_cfg=img_cfg,
             num_samples=args.eval_samples,
             label=label,
         )
