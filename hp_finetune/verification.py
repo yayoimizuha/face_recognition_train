@@ -15,7 +15,7 @@ import numpy as np
 import onnxruntime as ort
 from tqdm import tqdm
 
-from hp_finetune.data_utils import ImageConfig, load_eval_samples
+from hp_finetune.data_utils import DEFAULT_EVAL_SAMPLES, ImageConfig, load_eval_samples
 
 # ──────────────────────────────────────────────
 # Constants
@@ -24,7 +24,6 @@ VERIFY_BATCH_MIN = 2
 VERIFY_BATCH_MAX = 32
 VERIFY_BATCH_COUNT = 5
 FP32_MAX_DIFF_WARN_THRESHOLD = 1e-4
-DEFAULT_EVAL_SAMPLES = 50
 
 
 # ──────────────────────────────────────────────
@@ -37,8 +36,15 @@ def verify_dynamic_batch(
     num_classes: int,
     rng: np.random.Generator | None = None,
     label: str = "",
+    has_mahal: bool = False,
 ) -> None:
-    """Run inference with several random batch sizes and assert correct output shape."""
+    """Run inference with several random batch sizes and assert correct output shape.
+
+    When ``has_mahal=True`` the model outputs two tensors:
+    - ``outputs[0]``: logits ``(bs, num_classes)``
+    - ``outputs[1]``: anomaly_score ``(bs,)``
+    Both shapes are verified.
+    """
     if rng is None:
         rng = np.random.default_rng(0)
 
@@ -52,10 +58,21 @@ def verify_dynamic_batch(
     ]
     for bs in batch_sizes:
         test_in = np.random.randn(bs, 3, input_size, input_size).astype(np.float32)
-        out = sess.run(None, {"input": test_in})[0]
+        outputs = sess.run(None, {"input": test_in})
+        out = outputs[0]
         assert out.shape == (bs, num_classes), (
             f"{label} batch={bs}: expected ({bs}, {num_classes}), got {out.shape}"
         )
+        if has_mahal:
+            assert len(outputs) >= 2, (
+                f"{label} batch={bs}: expected 2 outputs (logits + anomaly_score), "
+                f"got {len(outputs)}"
+            )
+            anomaly_out = outputs[1]
+            assert anomaly_out.shape == (bs,), (
+                f"{label} batch={bs}: expected anomaly_score shape ({bs},), "
+                f"got {anomaly_out.shape}"
+            )
     print(f"{prefix}Dynamic batch OK: tested batch sizes {batch_sizes}")
 
 

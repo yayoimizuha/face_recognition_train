@@ -79,6 +79,7 @@ from hp_finetune.data_utils import get_inference_transform, load_train_dataset
 # Constants
 # ──────────────────────────────────────────────
 DEFAULT_TOP_K = 20
+DEFAULT_TOP_CLASS_K = 0  # 0 = 全クラス表示
 _SAFE_MAX_LEN = 40  # max chars for directory / file name components
 
 # Provider names as used by ORT
@@ -285,22 +286,41 @@ def _load_image_config_from_onnx(
     """Extract input_size, mean, std from ONNX metadata if present, else use defaults."""
     meta = sess.get_modelmeta().custom_metadata_map
 
-    # Try to read from embedded metadata (present when exported by export_onnx.py)
-    input_size: int = int(meta.get("input_size", 224))
     mean: list[float] = json.loads(meta.get("imagenet_mean", "[0.485, 0.456, 0.406]"))
     std: list[float] = json.loads(meta.get("imagenet_std", "[0.229, 0.224, 0.225]"))
 
-    # Fallback: infer input_size from the ONNX input shape
-    inp = sess.get_inputs()[0]
-    if (
-        inp.shape
-        and len(inp.shape) >= 4
-        and isinstance(inp.shape[2], int)
-        and inp.shape[2] > 0
-    ):
-        input_size = inp.shape[2]
+    # Prefer metadata key; fallback to ONNX input shape; final fallback to 224
+    if "input_size" in meta:
+        input_size: int = int(meta["input_size"])
+    else:
+        inp = sess.get_inputs()[0]
+        if (
+            inp.shape
+            and len(inp.shape) >= 4
+            and isinstance(inp.shape[2], int)
+            and inp.shape[2] > 0
+        ):
+            input_size = inp.shape[2]
+        else:
+            input_size = 224
 
     return input_size, mean, std
+
+
+def _load_mahal_threshold_from_onnx(sess: ort.InferenceSession) -> float | None:
+    """Read Mahalanobis threshold from ONNX metadata_props.
+
+    Returns the threshold value if present, or ``None`` if the model was
+    exported without Mahalanobis anomaly detection.
+    """
+    meta = sess.get_modelmeta().custom_metadata_map
+    val = meta.get("mahal_threshold")
+    return float(val) if val is not None else None
+
+
+def _has_anomaly_output(sess: ort.InferenceSession) -> bool:
+    """Return True if the ONNX model outputs an 'anomaly_score' tensor."""
+    return any(o.name == "anomaly_score" for o in sess.get_outputs())
 
 
 # ──────────────────────────────────────────────
@@ -312,14 +332,18 @@ def run_inference(
     input_size: int,
     mean: list[float],
     std: list[float],
-) -> tuple[list[int], list[int], list[np.ndarray], list[float]]:
+    *,
+    has_anomaly: bool = False,
+) -> tuple[list[int], list[int], list[np.ndarray], list[float], list[float | None]]:
     """Run inference over the full dataset.
 
     Returns:
-        true_labels:  list of ground-truth integer class indices
-        pred_labels:  list of predicted integer class indices
-        images:       list of original PIL images (RGB, not transformed)
-        confidences:  list of softmax confidence for the predicted class
+        true_labels:    list of ground-truth integer class indices
+        pred_labels:    list of predicted integer class indices
+        images:         list of original PIL images (RGB, not transformed)
+        confidences:    list of softmax confidence for the predicted class
+        anomaly_scores: list of Mahalanobis anomaly scores, or ``None`` per
+                        sample when the model has no anomaly detection output
     """
     from hp_finetune.data_utils import ImageConfig
 
@@ -336,13 +360,16 @@ def run_inference(
     pred_labels: list[int] = []
     images: list = []
     confidences: list[float] = []
+    anomaly_scores: list[float | None] = []
 
     for item in tqdm(dataset, desc="Inference", unit="img"):
         img = item["image"].convert("RGB")
         true_label: int = int(item["label"])
 
         x = transform(img).unsqueeze(0).numpy().astype(np.float32)
-        logits = sess.run(None, {input_name: x})[0][0]  # (num_classes,)
+        outputs = sess.run(None, {input_name: x})
+        logits = outputs[0][0]  # (num_classes,)
+        anomaly = float(outputs[1][0]) if has_anomaly else None
 
         pred_label = int(np.argmax(logits))
         probs = softmax(logits.astype(np.float64))
@@ -352,8 +379,9 @@ def run_inference(
         pred_labels.append(pred_label)
         images.append(img)
         confidences.append(confidence)
+        anomaly_scores.append(anomaly)
 
-    return true_labels, pred_labels, images, confidences
+    return true_labels, pred_labels, images, confidences, anomaly_scores
 
 
 # ──────────────────────────────────────────────
@@ -366,10 +394,15 @@ def save_wrong_images(
     confidences: list[float],
     class_names: list[str],
     output_dir: str,
+    *,
+    anomaly_scores: list[float | None] | None = None,
+    mahal_threshold: float | None = None,
 ) -> list[dict]:
     """Save misclassified images under <output_dir>/wrong_images/<pred>/<true>_NNN.jpg.
 
     Returns a list of dicts (one per wrong sample) for CSV output.
+    Includes ``anomaly_score`` and ``is_anomaly`` columns when *anomaly_scores*
+    is provided.
     """
     wrong_images_dir = os.path.join(output_dir, "wrong_images")
 
@@ -378,8 +411,10 @@ def save_wrong_images(
 
     records: list[dict] = []
 
-    for idx, (true_lbl, pred_lbl, img, conf) in enumerate(
-        zip(true_labels, pred_labels, images, confidences)
+    _anomaly_scores = anomaly_scores or [None] * len(true_labels)
+
+    for idx, (true_lbl, pred_lbl, img, conf, anomaly) in enumerate(
+        zip(true_labels, pred_labels, images, confidences, _anomaly_scores)
     ):
         if true_lbl == pred_lbl:
             continue
@@ -399,17 +434,20 @@ def save_wrong_images(
 
         img.save(filepath, format="JPEG", quality=90)
 
-        records.append(
-            {
-                "dataset_index": idx,
-                "true_label_idx": true_lbl,
-                "pred_label_idx": pred_lbl,
-                "true_class": class_names[true_lbl],
-                "pred_class": class_names[pred_lbl],
-                "confidence": f"{conf:.6f}",
-                "image_path": os.path.relpath(filepath, output_dir),
-            }
-        )
+        record: dict = {
+            "dataset_index": idx,
+            "true_label_idx": true_lbl,
+            "pred_label_idx": pred_lbl,
+            "true_class": class_names[true_lbl],
+            "pred_class": class_names[pred_lbl],
+            "confidence": f"{conf:.6f}",
+            "image_path": os.path.relpath(filepath, output_dir),
+        }
+        if anomaly is not None:
+            record["anomaly_score"] = f"{anomaly:.6f}"
+            if mahal_threshold is not None:
+                record["is_anomaly"] = "1" if anomaly > mahal_threshold else "0"
+        records.append(record)
 
     return records
 
@@ -418,12 +456,17 @@ def save_wrong_images(
 # CSV writers
 # ──────────────────────────────────────────────
 def save_wrong_predictions_csv(records: list[dict], output_dir: str) -> str:
-    """Write wrong_predictions.csv and return its path."""
+    """Write wrong_predictions.csv and return its path.
+
+    Columns ``anomaly_score`` and ``is_anomaly`` are written when present in
+    *records* (i.e. when the model was exported with Mahalanobis detection).
+    """
     path = os.path.join(output_dir, "wrong_predictions.csv")
     if not records:
         print("  No wrong predictions — skipping CSV.")
         return path
 
+    # Base columns always present
     fieldnames = [
         "dataset_index",
         "true_label_idx",
@@ -433,8 +476,14 @@ def save_wrong_predictions_csv(records: list[dict], output_dir: str) -> str:
         "confidence",
         "image_path",
     ]
+    # Append anomaly columns if the first record has them
+    if "anomaly_score" in records[0]:
+        fieldnames.append("anomaly_score")
+    if "is_anomaly" in records[0]:
+        fieldnames.append("is_anomaly")
+
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(records)
 
@@ -522,7 +571,13 @@ def print_summary(
     class_names: list[str],
     ranking: list[tuple],
     top_k: int,
+    *,
+    anomaly_scores: list[float | None] | None = None,
+    mahal_threshold: float | None = None,
+    top_class_k: int = DEFAULT_TOP_CLASS_K,
 ) -> None:
+    from collections import Counter as _Counter
+
     total = len(true_labels)
     correct = sum(t == p for t, p in zip(true_labels, pred_labels))
     wrong = total - correct
@@ -536,6 +591,58 @@ def print_summary(
     print(f"  Correct         : {correct}")
     print(f"  Wrong           : {wrong}")
     print(f"  Top-1 Accuracy  : {accuracy * 100:.2f}%")
+
+    # ── Anomaly detection summary ──────────────────────────────────
+    if anomaly_scores is not None and any(s is not None for s in anomaly_scores):
+        valid_scores = [s for s in anomaly_scores if s is not None]
+        mean_score = float(np.mean(valid_scores))
+        print()
+        print("Anomaly Detection (Mahalanobis)")
+        print("-" * 60)
+        if mahal_threshold is not None:
+            anomaly_count = sum(1 for s in valid_scores if s > mahal_threshold)
+            anomaly_rate = anomaly_count / len(valid_scores) * 100
+            print(f"  threshold        : {mahal_threshold:.4f}")
+            print(
+                f"  anomaly detected : {anomaly_count} / {len(valid_scores)} samples"
+                f" ({anomaly_rate:.2f}%)"
+            )
+        print(f"  mean score (all) : {mean_score:.4f}")
+        print(f"  min / max score  : {min(valid_scores):.4f} / {max(valid_scores):.4f}")
+
+    # ── Per-class accuracy ─────────────────────────────────────────
+    class_total = _Counter(true_labels)
+    class_correct = _Counter(t for t, p in zip(true_labels, pred_labels) if t == p)
+
+    rows = []
+    for cls_idx, name in enumerate(class_names):
+        n = class_total[cls_idx]
+        if n == 0:
+            continue
+        c = class_correct[cls_idx]
+        rows.append((name, c, n, c / n * 100))
+
+    # Sort by accuracy ascending (most confused first)
+    rows.sort(key=lambda r: r[3])
+
+    # 表示行数を制限（top_class_k=0 は全件）
+    display_rows = rows if top_class_k <= 0 else rows[:top_class_k]
+    title_suffix = (
+        f" (worst {top_class_k})" if top_class_k > 0 and top_class_k < len(rows) else ""
+    )
+
+    name_w = max(len(r[0]) for r in display_rows) if display_rows else 10
+    name_w = max(name_w, len("Class"))
+
+    print()
+    print(f"Per-class Accuracy{title_suffix} (sorted by accuracy, worst first)")
+    print("-" * (name_w + 30))
+    print(f"  {'Class':<{name_w}}  {'Correct':>7}  {'Total':>7}  {'Accuracy':>8}")
+    print(f"  {'-' * name_w}  {'-' * 7}  {'-' * 7}  {'-' * 8}")
+    for name, c, n, pct in display_rows:
+        print(f"  {name:<{name_w}}  {c:>7}  {n:>7}  {pct:>7.2f}%")
+    print("-" * (name_w + 30))
+
     print()
     print(f"Top-{top_k} Most Confused Class Pairs (true → predicted)")
     print("-" * 60)
@@ -577,6 +684,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_TOP_K,
         help=f"Number of top confused class pairs to display (default: {DEFAULT_TOP_K})",
+    )
+    parser.add_argument(
+        "--top-class-k",
+        type=int,
+        default=DEFAULT_TOP_CLASS_K,
+        help=(
+            "Number of per-class accuracy rows to display in the summary, "
+            "sorted by accuracy ascending (worst first). "
+            "0 = show all classes (default)."
+        ),
     )
     # ── Provider options ────────────────────────────────────────────
     parser.add_argument(
@@ -669,20 +786,31 @@ def main() -> None:
     )
     class_names = _load_class_names_from_onnx(sess)
     input_size, mean, std = _load_image_config_from_onnx(sess)
+    has_anomaly = _has_anomaly_output(sess)
+    mahal_threshold = _load_mahal_threshold_from_onnx(sess) if has_anomaly else None
     print(
         f"  num_classes={len(class_names)}  "
         f"input_size={input_size}  mean={mean}  std={std}"
     )
+    if has_anomaly:
+        print(f"  Mahalanobis anomaly detection: enabled  threshold={mahal_threshold}")
 
     # ── 2. Run inference ────────────────────────────────────────────
-    true_labels, pred_labels, images, confidences = run_inference(
-        sess, class_names, input_size, mean, std
+    true_labels, pred_labels, images, confidences, anomaly_scores = run_inference(
+        sess, class_names, input_size, mean, std, has_anomaly=has_anomaly
     )
 
     # ── 3. Save wrong images ────────────────────────────────────────
     print("Saving wrong images...")
     wrong_records = save_wrong_images(
-        true_labels, pred_labels, images, confidences, class_names, output_dir
+        true_labels,
+        pred_labels,
+        images,
+        confidences,
+        class_names,
+        output_dir,
+        anomaly_scores=anomaly_scores,
+        mahal_threshold=mahal_threshold,
     )
     print(f"  Saved {len(wrong_records)} wrong images")
 
@@ -703,7 +831,16 @@ def main() -> None:
     print(f"  Saved: {acc_path}")
 
     # ── 7. Print summary ────────────────────────────────────────────
-    print_summary(true_labels, pred_labels, class_names, ranking, args.top_k)
+    print_summary(
+        true_labels,
+        pred_labels,
+        class_names,
+        ranking,
+        args.top_k,
+        anomaly_scores=anomaly_scores,
+        mahal_threshold=mahal_threshold,
+        top_class_k=args.top_class_k,
+    )
 
 
 if __name__ == "__main__":

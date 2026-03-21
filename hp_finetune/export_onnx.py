@@ -1,42 +1,52 @@
 """
-Export a trained .pt checkpoint to five ONNX variants and apply INT8 static
-quantization with calibration data from the training dataset.
+Export a trained .pt checkpoint to seven ONNX variants with per-block
+weight quantization (Block-FP8 style).
 
-All models output **classification logits** (arc_s * cos_similarity) over
-num_classes.  Apply softmax on the consumer side to obtain probabilities.
-Output shape: (batch_size, num_classes).
+Uses only standard ONNX nodes (Cast, Mul, Reshape, Slice) for weight
+restoration — no DequantizeLinear — ensuring full TensorRT compatibility.
 
-Class label names are embedded in ONNX metadata_props ("class_names" JSON,
-"num_classes" str) so that a single ONNX file is a fully self-contained,
-portable classification model.
+Two checkpoint types are supported:
+  - model_best.pt                  (classification only)
+  - model_best_with_mahal.pt       (classification + Mahalanobis anomaly detection)
 
+Output variants:
+    <stem>.onnx              -- fp32  weights, fp32  activations
+    <stem>_bf16.onnx         -- bf16  weights, bf16  activations (graph-wide)
+    <stem>_fp16.onnx         -- fp16  weights, fp16  activations (graph-wide)
+    <stem>_bf16int8.onnx     -- per-block INT8 weights (bf16 scale) + bf16 activations
+    <stem>_bf16fp8.onnx      -- per-block FP8  weights (bf16 scale) + bf16 activations
+    <stem>_fp16int8.onnx     -- per-block INT8 weights (fp16 scale) + fp16 activations
+    <stem>_fp16fp8.onnx      -- per-block FP8  weights (fp16 scale) + fp16 activations
+
+Mahalanobis nodes are always kept in fp32 for numerical stability.
 Batch size is dynamic (any batch size works at inference time).
+Class label names are embedded in ONNX metadata_props.
+
+Sensitive weight nodes (those that degrade model accuracy when quantized)
+are automatically detected via a 2-stage hybrid approach:
+  Stage 1: weight reconstruction error (NRMSE) — fast, no inference
+  Stage 2: output difference on probe samples — accurate, for suspect nodes
 
 Usage:
-    python hp_finetune/export_onnx.py --checkpoint hp_finetune/work_dirs/<run>/model_best.pt
+    python hp_finetune/export_onnx.py \\
+        --checkpoint hp_finetune/work_dirs/<run>/model_best_with_mahal.pt
 
-Outputs (saved next to the checkpoint):
-    <stem>.onnx            -- fp32  weights, fp32  activations
-    <stem>_fp16.onnx       -- fp16  weights, fp16  activations (GPU fp16 inference)
-    <stem>_bf16.onnx       -- bf16  weights, bf16  activations (GPU bf16 inference)
-    <stem>_fp16int8.onnx   -- INT8  Conv (sensitive nodes excluded) + fp16 residual weights
-    <stem>_bf16int8.onnx   -- INT8  Conv (sensitive nodes excluded) + bf16 residual weights
-
-fp16 / bf16 notes:
-  - Full fp16/bf16 models require a GPU runtime that supports native fp16/bf16
-    execution (e.g. ONNX Runtime + CUDA on Ampere or later).  On CPU they fall
-    back to fp32 and will not be faster than the fp32 model.
-  - fp16int8 / bf16int8 store the non-quantised residual weights in fp16/bf16
-    to reduce file size; actual INT8 Conv ops are hardware-accelerated on most
-    modern runtimes regardless of the residual dtype.
+    python hp_finetune/export_onnx.py \\
+        --checkpoint hp_finetune/work_dirs/<run>/model_best_with_mahal.pt \\
+        --block-size 64 --nrmse-threshold 0.01
 """
 
+from __future__ import annotations
+
 import argparse
+import json
+import math
 import os
 import sys
-import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import copy
 
 import numpy as np
 import onnx
@@ -44,29 +54,24 @@ import onnxruntime as ort
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from onnxconverter_common import float16 as onnx_float16
-from onnxruntime.quantization import (
-    CalibrationDataReader,
-    CalibrationMethod,
-    QuantFormat,
-    QuantType,
-    quantize_static,
-)
-from onnxruntime.quantization.shape_inference import quant_pre_process
 
 from hp_finetune.config_loader import RunConfig, load_run_config
 from hp_finetune.data_utils import (
     DEFAULT_CALIB_SAMPLES,
     DEFAULT_EVAL_SAMPLES,
-    FaceCalibrationDataReader,
     ImageConfig,
     get_class_names_from_dataset,
     get_real_sample,
+    load_eval_samples,
 )
 from hp_finetune.finetune_facenet import FaceRecognitionModel
 from hp_finetune.onnx_graph_utils import (
+    convert_graph_to_bf16,
+    convert_graph_to_fp16,
     embed_class_metadata,
     fix_hardcoded_batch_in_reshapes,
+    get_mahal_initializer_names,
+    infer_shapes_for_tensorrt,
     make_batch_dim_dynamic,
     merge_external_data,
 )
@@ -76,93 +81,36 @@ from hp_finetune.verification import (
     print_file_sizes,
     verify_dynamic_batch,
 )
-from hp_finetune.weight_conversion import TargetDtype, convert_initializers
+from hp_finetune.weight_conversion import (
+    DEFAULT_BLOCK_SIZE,
+    DEFAULT_FP8_FORMAT,
+    DEFAULT_OUTPUT_DIFF_THRESHOLD,
+    DEFAULT_SENSITIVITY_SAMPLES,
+    DEFAULT_WEIGHT_NRMSE_THRESHOLD,
+    QuantDtype,
+    TargetDtype,
+    apply_block_quantization,
+    find_sensitive_initializers,
+)
+
 
 # ──────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────
-DEFAULT_OPSET = 18
+DEFAULT_OPSET = 19  # opset 19 required for FLOAT8E4M3FN
 
-# INT8 量子化対象のオペレータ。
-# Conv と Gemm (Linear) のみを量子化する。これらは計算量が大きく INT8 の恩恵が
-# 最も大きい一方、量子化耐性も比較的高い。
-#
-# ただし Conv/Gemm の中にも量子化に敏感なノードが存在する。
-# _find_sensitive_nodes() で動的に特定し nodes_to_exclude で除外する。
-#
-# 以下は量子化対象から除外 (op_types_to_quantize に含めない):
-# - Sigmoid, Clip: GWAP の exp(sigmoid(score)) チェーンで使われており、
-#   [0,1] の狭い値域を INT8 (256 levels) で量子化すると精度が大幅に劣化する。
-# - Relu: QDQ ノード挿入のオーバーヘッドが増える割に計算量削減が小さい。
-# - Softmax, LayerNorm, MatMul (attention): 精度劣化が大きい。
-# - BatchNormalization: per_channel 量子化で axis out-of-range エラーを起こす。
-OP_TYPES_TO_QUANTIZE = ["Conv", "Gemm"]
-
-_RESIDUAL_DTYPE_MAP: dict[str, TargetDtype] = {
-    "fp16": TargetDtype.FP16,
-    "bf16": TargetDtype.BF16,
+_FP8_FORMAT_MAP: dict[str, QuantDtype] = {
+    "e4m3fn": QuantDtype.FP8E4M3,
+    "e4m3": QuantDtype.FP8E4M3,
+    "e5m2": QuantDtype.FP8E5M2,
 }
-
-# 動的感度検出のしきい値。
-# 1ノードを INT8 量子化したときの fp32 との最大絶対差がこの値を超えたら
-# そのノードを除外候補とみなす。
-_SENSITIVITY_DIFF_THRESHOLD = 0.5
-
-# キャリブレーション手法マッピング。
-# CLI の --calib-method 文字列を CalibrationMethod に対応させる。
-_CALIB_METHOD_MAP: dict[str, CalibrationMethod] = {
-    "minmax": CalibrationMethod.MinMax,
-    "entropy": CalibrationMethod.Entropy,
-    "percentile": CalibrationMethod.Percentile,
-}
-
-
-def _build_calib_options(
-    calib_method: str,
-    percentile: float,
-    *,
-    activation_symmetric: bool = False,
-    weight_symmetric: bool = True,
-) -> tuple[CalibrationMethod, dict]:
-    """Return ``(CalibrationMethod, extra_options)`` for :func:`quantize_static`.
-
-    Args:
-        calib_method: One of ``"minmax"``, ``"entropy"``, ``"percentile"``.
-        percentile: Cutoff value used only when *calib_method* is
-            ``"percentile"`` (e.g. ``99.999``).
-        activation_symmetric: Passed to ``extra_options["ActivationSymmetric"]``.
-        weight_symmetric: Passed to ``extra_options["WeightSymmetric"]``.
-
-    Returns:
-        A 2-tuple ``(method, extra_options)`` ready to unpack into
-        ``quantize_static``.
-    """
-    method = _CALIB_METHOD_MAP[calib_method]
-    extra: dict = {
-        "ActivationSymmetric": activation_symmetric,
-        "WeightSymmetric": weight_symmetric,
-    }
-    if calib_method == "percentile":
-        extra["PercentileCalibrationValue"] = percentile
-    return method, extra
 
 
 # ──────────────────────────────────────────────
 # Classification wrapper for ONNX export
 # ──────────────────────────────────────────────
-class ClassificationModel(nn.Module):
-    """backbone + GWAP + head + arc_weight -> classification logits.
-
-    Output is arc_s * cos_similarity(emb, arc_weight): ``(B, num_classes)``
-    logits equivalent to ``FaceRecognitionModel.cos_logits()`` (no margin).
-    Apply softmax on the consumer side for probabilities.
-
-    Example::
-
-        logits = sess.run(None, {"input": x})[0]   # (B, num_classes)
-        probs  = softmax(logits, axis=1)
-        pred   = logits.argmax(axis=1)
-    """
+class _ClassificationBase(nn.Module):
+    """Common base: backbone + GWAP + head + arc_weight initialisation."""
 
     def __init__(self, full_model: FaceRecognitionModel):
         super().__init__()
@@ -170,225 +118,147 @@ class ClassificationModel(nn.Module):
         self.gwap = full_model.gwap
         self.head = full_model.head
         self.arc_s = full_model.arc_s
-        # Pre-normalised arc_weight as a frozen buffer
         w = F.normalize(full_model.arc_weight.data, dim=1)
         self.register_buffer("arc_weight_normalized", w)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _embed_and_classify(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         feat = self.backbone.forward_features(x)
         pooled = self.gwap(feat)
-        emb = self.head(pooled)
-        emb = F.normalize(emb, dim=1)
-        cos_sim = F.linear(emb, self.arc_weight_normalized)  # (B, num_classes)
-        return cos_sim * self.arc_s  # logits
+        raw_emb = self.head(pooled)
+        emb_norm = F.normalize(raw_emb, dim=1)
+        logits = F.linear(emb_norm, self.arc_weight_normalized) * self.arc_s
+        return raw_emb, logits
+
+
+class ClassificationModel(_ClassificationBase):
+    """backbone + GWAP + head + arc_weight → logits ``(B, num_classes)``."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _raw_emb, logits = self._embed_and_classify(x)
+        return logits
+
+
+class ClassificationWithAnomalyModel(_ClassificationBase):
+    """backbone + GWAP + head + arc_weight + Mahalanobis → (logits, anomaly_score)."""
+
+    def __init__(self, full_model: FaceRecognitionModel):
+        super().__init__(full_model)
+        self.register_buffer("mahal_mean", full_model.mahal.mean.clone())
+        self.register_buffer("mahal_precision", full_model.mahal.precision.clone())
+        self.register_buffer("mahal_threshold", full_model.mahal.threshold.clone())
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        raw_emb, logits = self._embed_and_classify(x)
+        diff = raw_emb - self.mahal_mean
+        left = diff @ self.mahal_precision
+        dist_sq = (left * diff).sum(dim=1).clamp(min=0.0)
+        anomaly_score = dist_sq.sqrt()
+        return logits, anomaly_score
 
 
 # ──────────────────────────────────────────────
 # Checkpoint loading
 # ──────────────────────────────────────────────
 def _detect_num_classes(state_dict: dict, num_classes_arg: int | None) -> int:
-    """Auto-detect num_classes from arc_weight in checkpoint.
-
-    If ``--num-classes`` is given, prefer that but warn on mismatch.
-    """
     has_arc_weight = "arc_weight" in state_dict
-
     if num_classes_arg is None:
         if not has_arc_weight:
-            print(
-                "Error: --num-classes not specified and arc_weight "
-                "not found in checkpoint"
-            )
+            print("Error: --num-classes not specified and arc_weight not found")
             sys.exit(1)
         num_classes = state_dict["arc_weight"].shape[0]
         print(f"  Auto-detected num_classes={num_classes} from arc_weight shape")
         return num_classes
-
     if has_arc_weight:
-        ckpt_num_classes = state_dict["arc_weight"].shape[0]
-        if num_classes_arg != ckpt_num_classes:
+        ckpt_nc = state_dict["arc_weight"].shape[0]
+        if num_classes_arg != ckpt_nc:
             print(
                 f"  [WARN] --num-classes={num_classes_arg} but "
-                f"arc_weight has {ckpt_num_classes} classes"
+                f"arc_weight has {ckpt_nc} classes"
             )
     return num_classes_arg
 
 
-def load_classification_model(
+def _detect_mahalanobis(state_dict: dict) -> bool:
+    key = "mahal.threshold"
+    if key not in state_dict:
+        return False
+    val = float(state_dict[key])
+    return not (val == float("inf") or math.isnan(val))
+
+
+def load_model_for_export(
     checkpoint_path: str,
     num_classes: int | None,
     run_cfg: RunConfig,
-) -> ClassificationModel:
-    """Load a checkpoint and return the inference-ready classification model."""
+) -> tuple[ClassificationModel | ClassificationWithAnomalyModel, bool]:
+    """Load checkpoint and return inference-ready export wrapper.
+
+    Returns ``(model, has_mahal)``.
+    """
     state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    detected_num_classes = _detect_num_classes(state_dict, num_classes)
+    detected_nc = _detect_num_classes(state_dict, num_classes)
+    has_mahal = _detect_mahalanobis(state_dict)
 
     full_model = FaceRecognitionModel(
         backbone_name=run_cfg.backbone,
         backbone_dim=run_cfg.backbone_dim,
         hidden_dim=run_cfg.hidden_dim,
         emb_size=run_cfg.emb_size,
-        num_classes=detected_num_classes,
+        num_classes=detected_nc,
+        dropout=run_cfg.dropout,
+        arc_s=run_cfg.arc_s,
+        arc_m=run_cfg.arc_m,
     )
     full_model.load_state_dict(state_dict)
     full_model.eval()
 
-    cls_model = ClassificationModel(full_model)
-    cls_model.eval()
-    return cls_model
+    if has_mahal:
+        threshold = float(state_dict["mahal.threshold"])
+        print(
+            f"  Mahalanobis detected (threshold={threshold:.4f}) "
+            f"→ ClassificationWithAnomalyModel"
+        )
+        export_model: ClassificationModel | ClassificationWithAnomalyModel = (
+            ClassificationWithAnomalyModel(full_model)
+        )
+    else:
+        print("  No Mahalanobis → ClassificationModel (logits only)")
+        export_model = ClassificationModel(full_model)
+
+    export_model.eval()
+    return export_model, has_mahal
 
 
 # ──────────────────────────────────────────────
-# INT8 sensitive node detection (dynamic, output-difference based)
-# ──────────────────────────────────────────────
-class _SensitivityProbeReader(CalibrationDataReader):
-    """Lightweight :class:`CalibrationDataReader` backed by a pre-built sample list.
-
-    Used internally by :func:`_find_sensitive_nodes` to probe one Conv/Gemm
-    node at a time without reloading data from disk.
-    """
-
-    def __init__(self, samples: list[np.ndarray]):
-        self._samples = samples
-        self._iter = iter(self._samples)
-
-    def get_next(self) -> dict[str, np.ndarray] | None:
-        try:
-            return {"input": next(self._iter)}
-        except StopIteration:
-            return None
-
-    def rewind(self) -> None:
-        self._iter = iter(self._samples)
-
-
-def _find_sensitive_nodes(
-    preprocessed_path: str,
-    img_cfg: ImageConfig,
-    calib_samples: list[np.ndarray],
-    *,
-    threshold: float = _SENSITIVITY_DIFF_THRESHOLD,
-    calib_method: str = "minmax",
-    percentile: float = 99.999,
-) -> list[str]:
-    """Identify Conv/Gemm nodes that degrade badly under INT8 quantization.
-
-    For each Conv/Gemm node, a temporary model is quantized with *only that
-    node* included in quantization.  A few calibration samples are run through
-    both the fp32 base and the single-node-quantized model; if the maximum
-    absolute output difference exceeds *threshold*, the node is flagged as
-    sensitive and will be excluded from the full quantization pass.
-
-    This approach is architecture-agnostic: it does not rely on MobileNetV4-
-    specific node name patterns.
-
-    Args:
-        preprocessed_path: Path to the pre-processed (shape-inferred) fp32 ONNX.
-        img_cfg: Image config (used only for shape information in error messages).
-        calib_samples: Small list of calibration numpy arrays ``(1,3,H,W)``.
-        threshold: Max-abs-diff threshold above which a node is sensitive.
-        calib_method: Calibration method (``"minmax"``, ``"entropy"``,
-            ``"percentile"``).  Passed to the single-node probe so the scan
-            uses the same statistics strategy as the full quantization.
-        percentile: Cutoff used only when *calib_method* is ``"percentile"``.
-
-    Returns:
-        List of node names to exclude from quantization.
-    """
-    model = onnx.load(preprocessed_path)
-    candidate_nodes = [
-        node
-        for node in model.graph.node
-        if node.op_type in ("Conv", "Gemm") and node.name
-    ]
-
-    if not candidate_nodes:
-        return []
-
-    print(
-        f"  Sensitivity scan: testing {len(candidate_nodes)} Conv/Gemm nodes "
-        f"with {len(calib_samples)} samples (threshold={threshold})..."
-    )
-
-    # fp32 baseline outputs
-    sess_fp32 = ort.InferenceSession(preprocessed_path)
-    fp32_outputs = [sess_fp32.run(None, {"input": s})[0] for s in calib_samples]
-
-    sensitive: list[str] = []
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        _probe_method, _probe_extra = _build_calib_options(calib_method, percentile)
-        for node in candidate_nodes:
-            node_name = node.name
-            tmp_path = os.path.join(tmp_dir, "single_node_quant.onnx")
-
-            # Minimal CalibrationDataReader for a single-node quantization probe
-            probe_reader = _SensitivityProbeReader(calib_samples)
-
-            try:
-                quantize_static(
-                    model_input=preprocessed_path,
-                    model_output=tmp_path,
-                    calibration_data_reader=probe_reader,
-                    quant_format=QuantFormat.QDQ,
-                    activation_type=QuantType.QUInt8,
-                    weight_type=QuantType.QInt8,
-                    per_channel=True,
-                    reduce_range=False,
-                    op_types_to_quantize=["Conv", "Gemm"],
-                    nodes_to_quantize=[node_name],
-                    calibrate_method=_probe_method,
-                    extra_options=_probe_extra,
-                )
-            except Exception as e:
-                # If quantizing this single node fails outright, exclude it
-                print(f"    [{node_name}] quantization failed ({e!s:.80}), excluding")
-                sensitive.append(node_name)
-                continue
-
-            try:
-                sess_q = ort.InferenceSession(tmp_path)
-                max_diff = max(
-                    float(
-                        np.max(
-                            np.abs(fp32_outputs[i] - sess_q.run(None, {"input": s})[0])
-                        )
-                    )
-                    for i, s in enumerate(calib_samples)
-                )
-            except Exception as e:
-                print(f"    [{node_name}] inference failed ({e!s:.80}), excluding")
-                sensitive.append(node_name)
-                continue
-
-            if max_diff > threshold:
-                print(
-                    f"    [{node_name}] sensitive  max_diff={max_diff:.4f} > {threshold}"
-                )
-                sensitive.append(node_name)
-
-    print(
-        f"  Sensitivity scan complete: "
-        f"{len(sensitive)}/{len(candidate_nodes)} nodes excluded"
-    )
-    return sensitive
-
-
-# ──────────────────────────────────────────────
-# Export: fp32 (base model)
+# Export: FP32 (base model)
 # ──────────────────────────────────────────────
 def export_fp32_onnx(
-    cls_model: ClassificationModel,
+    cls_model: ClassificationModel | ClassificationWithAnomalyModel,
     onnx_path: str,
     opset: int,
     *,
     img_cfg: ImageConfig,
     num_classes: int,
     class_names: list[str],
+    has_mahal: bool = False,
 ) -> None:
     """Export PyTorch model to fp32 ONNX with dynamic batch and metadata."""
     print(f"Exporting fp32 ONNX to: {onnx_path}")
     dummy_input = torch.randn(1, 3, img_cfg.input_size, img_cfg.input_size)
+
+    if has_mahal:
+        output_names = ["logits", "anomaly_score"]
+        dynamic_axes = {
+            "input": {0: "batch_size"},
+            "logits": {0: "batch_size"},
+            "anomaly_score": {0: "batch_size"},
+        }
+    else:
+        output_names = ["logits"]
+        dynamic_axes = {
+            "input": {0: "batch_size"},
+            "logits": {0: "batch_size"},
+        }
 
     torch.onnx.export(
         cls_model,
@@ -396,11 +266,8 @@ def export_fp32_onnx(
         onnx_path,
         opset_version=opset,
         input_names=["input"],
-        output_names=["logits"],
-        dynamic_axes={
-            "input": {0: "batch_size"},
-            "logits": {0: "batch_size"},
-        },
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
     )
 
     merge_external_data(onnx_path)
@@ -420,77 +287,68 @@ def export_fp32_onnx(
     make_batch_dim_dynamic(onnx_model)
     onnx.save(onnx_model, onnx_path)
 
-    # Verify
-    print("  Verifying dynamic batch with random batch sizes...")
+    # Verify dynamic batch
+    print("  Verifying dynamic batch...")
     verify_dynamic_batch(
         onnx_path,
         input_size=img_cfg.input_size,
         num_classes=num_classes,
         rng=np.random.default_rng(0),
         label="fp32",
+        has_mahal=has_mahal,
     )
 
     onnx_model = onnx.load(onnx_path)
     onnx.checker.check_model(onnx_model)
     print(f"  fp32 ONNX model verified (opset={opset})")
 
-    # Embed class metadata
+    # Embed metadata
     embed_class_metadata(onnx_model, class_names)
-    onnx.save(onnx_model, onnx_path)
-    print(f"  Embedded {len(class_names)} class names in metadata_props")
+    img_size_entry = onnx_model.metadata_props.add()
+    img_size_entry.key = "input_size"
+    img_size_entry.value = str(img_cfg.input_size)
+    mean_entry = onnx_model.metadata_props.add()
+    mean_entry.key = "imagenet_mean"
+    mean_entry.value = json.dumps(img_cfg.mean)
+    std_entry = onnx_model.metadata_props.add()
+    std_entry.key = "imagenet_std"
+    std_entry.value = json.dumps(img_cfg.std)
 
-    # Verify output vs PyTorch (single real image)
-    print("Verifying fp32 ONNX output vs PyTorch (real image)...")
+    if has_mahal and isinstance(cls_model, ClassificationWithAnomalyModel):
+        threshold_val = float(cls_model.mahal_threshold.item())
+        entry = onnx_model.metadata_props.add()
+        entry.key = "mahal_threshold"
+        entry.value = str(threshold_val)
+        print(f"  Embedded mahal_threshold={threshold_val:.6f}")
+
+    onnx.save(onnx_model, onnx_path)
+    print(
+        f"  Embedded {len(class_names)} class names, "
+        f"input_size={img_cfg.input_size}, mean/std in metadata_props"
+    )
+
+    # Verify output vs PyTorch
+    print("  Verifying fp32 ONNX output vs PyTorch (real image)...")
     real_sample = get_real_sample(img_cfg)
     real_tensor = torch.from_numpy(real_sample)
-    with torch.no_grad():
-        pt_out = cls_model(real_tensor).numpy()
     sess = ort.InferenceSession(onnx_path)
-    ort_out = sess.run(None, {"input": real_sample})[0]
-    compare_outputs(pt_out, ort_out, label="PyTorch vs fp32 ONNX")
+    with torch.no_grad():
+        pt_outputs = cls_model(real_tensor)
+    if has_mahal:
+        pt_logits, pt_anomaly = pt_outputs
+        ort_logits, ort_anomaly = sess.run(None, {"input": real_sample})
+        compare_outputs(pt_logits.numpy(), ort_logits, label="PyTorch vs fp32 (logits)")
+        compare_outputs(
+            pt_anomaly.numpy(), ort_anomaly, label="PyTorch vs fp32 (anomaly)"
+        )
+    else:
+        pt_logits = pt_outputs
+        ort_logits = sess.run(None, {"input": real_sample})[0]
+        compare_outputs(pt_logits.numpy(), ort_logits, label="PyTorch vs fp32")
 
 
 # ──────────────────────────────────────────────
-# Export: full fp16
-# ──────────────────────────────────────────────
-def export_fp16_onnx(
-    fp32_path: str,
-    fp16_path: str,
-    *,
-    img_cfg: ImageConfig,
-    num_classes: int,
-    class_names: list[str],
-) -> None:
-    """Convert entire fp32 graph to fp16 (GPU Ampere+ accelerated).
-
-    I/O tensors stay fp32 (``keep_io_types=True``) for consumer convenience.
-    """
-    print(f"Exporting fp16 ONNX to: {fp16_path}")
-    fp32_model = onnx.load(fp32_path)
-
-    fp16_model = onnx_float16.convert_float_to_float16(
-        fp32_model,
-        keep_io_types=True,
-        disable_shape_infer=False,
-        check_fp16_ready=False,
-    )
-
-    embed_class_metadata(fp16_model, class_names)
-    onnx.save(fp16_model, fp16_path)
-
-    print("  Verifying fp16 dynamic batch...")
-    verify_dynamic_batch(
-        fp16_path,
-        input_size=img_cfg.input_size,
-        num_classes=num_classes,
-        rng=np.random.default_rng(2),
-        label="fp16",
-    )
-    print(f"  fp16 ONNX saved: {fp16_path}")
-
-
-# ──────────────────────────────────────────────
-# Export: full bf16
+# Export: BF16 (graph-wide)
 # ──────────────────────────────────────────────
 def export_bf16_onnx(
     fp32_path: str,
@@ -499,22 +357,13 @@ def export_bf16_onnx(
     img_cfg: ImageConfig,
     num_classes: int,
     class_names: list[str],
+    has_mahal: bool = False,
 ) -> None:
-    """Convert all fp32 weights to bf16 (stored as bf16, Cast to fp32 at runtime).
+    """Convert fp32 graph to bf16 (weights + activations via Cast)."""
+    print(f"\nExporting bf16 ONNX to: {bf16_path}")
+    fp32_model = onnx.load(fp32_path)
 
-    I/O stays fp32; no consumer-side dtype handling needed.
-    """
-    print(f"Exporting bf16 ONNX to: {bf16_path}")
-    bf16_model = onnx.load(fp32_path)
-
-    converted = convert_initializers(
-        bf16_model,
-        TargetDtype.BF16,
-        min_elements=0,
-        exclude_quant_params=False,
-    )
-    print(f"  Converted {converted} initializers to bf16")
-
+    bf16_model = convert_graph_to_bf16(fp32_model, has_mahal=has_mahal)
     embed_class_metadata(bf16_model, class_names)
     onnx.save(bf16_model, bf16_path)
 
@@ -525,135 +374,183 @@ def export_bf16_onnx(
         num_classes=num_classes,
         rng=np.random.default_rng(3),
         label="bf16",
+        has_mahal=has_mahal,
     )
     print(f"  bf16 ONNX saved: {bf16_path}")
 
 
 # ──────────────────────────────────────────────
-# Export: INT8 static quantization
+# Export: FP16 (graph-wide)
 # ──────────────────────────────────────────────
-def export_int8_onnx(
+def export_fp16_onnx(
     fp32_path: str,
-    int8_path: str,
-    calib_samples: int,
+    fp16_path: str,
     *,
     img_cfg: ImageConfig,
     num_classes: int,
     class_names: list[str],
-    residual_dtype: str = "fp16",
-    calib_method: str = "minmax",
-    percentile: float = 99.999,
+    has_mahal: bool = False,
 ) -> None:
-    """Produce an INT8 statically-quantized model from the fp32 base.
+    """Convert fp32 graph to fp16 (weights + activations)."""
+    print(f"\nExporting fp16 ONNX to: {fp16_path}")
+    fp32_model = onnx.load(fp32_path)
 
-    Sensitive Conv/Gemm nodes are detected dynamically by comparing per-node
-    INT8 output against fp32; nodes with large divergence are excluded.
-    Residual (non-quantized) weights are compressed to *residual_dtype*
-    ("fp16"/"bf16").
+    fp16_model = convert_graph_to_fp16(fp32_model, has_mahal=has_mahal)
+    embed_class_metadata(fp16_model, class_names)
+    onnx.save(fp16_model, fp16_path)
 
-    Args:
-        calib_method: One of ``"minmax"`` (default), ``"entropy"``,
-            ``"percentile"``.  Both the sensitivity scan and the final
-            quantization pass use the same method for consistency.
-        percentile: Cutoff used only when *calib_method* is ``"percentile"``.
-    """
-    label = f"INT8+{residual_dtype}"
-    print(f"Running {label} quantization with calibration...")
-    print(f"  calibration samples: {calib_samples}")
-    print(
-        f"  calibration method:  {calib_method}"
-        + (f" (percentile={percentile})" if calib_method == "percentile" else "")
-    )
-    print(f"  quantized op types: {OP_TYPES_TO_QUANTIZE}")
-
-    # Pre-process: shape inference + model optimization
-    preprocessed_path = fp32_path.replace(".onnx", "_preproc.onnx")
-    print(f"  Pre-processing for quantization: {preprocessed_path}")
-    quant_pre_process(
-        input_model=fp32_path,
-        output_model_path=preprocessed_path,
-        skip_symbolic_shape=True,
-    )
-
-    # Build calibration data (reused for sensitivity scan + quantization)
-    calib_reader = FaceCalibrationDataReader(img_cfg, num_samples=calib_samples)
-    probe_samples = calib_reader.samples[: min(8, len(calib_reader.samples))]
-
-    # Identify sensitive nodes dynamically via output-difference comparison
-    nodes_to_exclude = _find_sensitive_nodes(
-        preprocessed_path,
-        img_cfg,
-        probe_samples,
-        calib_method=calib_method,
-        percentile=percentile,
-    )
-    print(f"  Excluding {len(nodes_to_exclude)} sensitive nodes from quantization")
-
-    calib_method_enum, extra_options = _build_calib_options(calib_method, percentile)
-    calib_reader.rewind()
-    quantize_static(
-        model_input=preprocessed_path,
-        model_output=int8_path,
-        calibration_data_reader=calib_reader,
-        quant_format=QuantFormat.QDQ,
-        activation_type=QuantType.QUInt8,
-        weight_type=QuantType.QInt8,
-        per_channel=True,
-        reduce_range=False,
-        op_types_to_quantize=OP_TYPES_TO_QUANTIZE,
-        nodes_to_exclude=nodes_to_exclude,
-        calibrate_method=calib_method_enum,
-        extra_options=extra_options,
-    )
-
-    # Clean up intermediate file
-    if os.path.exists(preprocessed_path):
-        os.remove(preprocessed_path)
-
-    # Post-process: check, fix Reshape, dynamic batch, residual compression
-    onnx_int8_model = onnx.load(int8_path)
-    onnx.checker.check_model(onnx_int8_model)
-
-    print(f"  Fixing {label} model batch dimensions...")
-    fix_hardcoded_batch_in_reshapes(
-        onnx_int8_model,
-        int8_path,
-        input_size=img_cfg.input_size,
-        rng=np.random.default_rng(1),
-        label=label,
-    )
-    make_batch_dim_dynamic(onnx_int8_model)
-
-    # Compress residual fp32 weights to fp16/bf16
-    target_dtype = _RESIDUAL_DTYPE_MAP[residual_dtype]
-    residual_count = convert_initializers(onnx_int8_model, target_dtype)
-    print(
-        f"  Converted {residual_count} residual weight initializers to {residual_dtype}"
-    )
-
-    embed_class_metadata(onnx_int8_model, class_names)
-    print(f"  Embedded {len(class_names)} class names in metadata_props")
-    onnx.save(onnx_int8_model, int8_path)
-
-    # Verify
-    print(f"  Verifying {label} dynamic batch with random batch sizes...")
+    print("  Verifying fp16 dynamic batch...")
     verify_dynamic_batch(
-        int8_path,
+        fp16_path,
         input_size=img_cfg.input_size,
         num_classes=num_classes,
-        rng=np.random.default_rng(1),
-        label=label,
+        rng=np.random.default_rng(2),
+        label="fp16",
+        has_mahal=has_mahal,
     )
-    print(f"  {label} ONNX model saved and verified: {int8_path}")
+    print(f"  fp16 ONNX saved: {fp16_path}")
 
-    # Quick output quality check (single real image)
-    print(f"Verifying {label} ONNX output vs fp32 ONNX (real image, logits)...")
+
+# ──────────────────────────────────────────────
+# Export: block-quantized models (INT8 / FP8)
+# ──────────────────────────────────────────────
+def export_block_quantized_onnx(
+    base_reduced_path: str,
+    fp32_path: str,
+    output_path: str,
+    quant_dtype: QuantDtype,
+    scale_dtype: TargetDtype,
+    quantize_names: list[str],
+    *,
+    block_size: int,
+    img_cfg: ImageConfig,
+    num_classes: int,
+    class_names: list[str],
+    has_mahal: bool = False,
+) -> None:
+    """Apply per-block quantization to a bf16/fp16 base model.
+
+    Args:
+        base_reduced_path: Path to the bf16 or fp16 ONNX model.
+        fp32_path: Path to the fp32 ONNX model (for metadata / verification).
+        output_path: Output path for the quantized model.
+        quant_dtype: INT8 or FP8 variant.
+        scale_dtype: BF16 or FP16 for scale storage.
+        quantize_names: Initializer names to quantize (from sensitivity detection).
+        block_size: Elements per quantization block.
+        img_cfg: Image preprocessing config.
+        num_classes: Number of classes.
+        class_names: Class label names.
+        has_mahal: Whether model has Mahalanobis anomaly detection.
+    """
+    label = f"{scale_dtype.value}+{quant_dtype.value}"
+    print(f"\nExporting {label} ONNX to: {output_path}")
+    print(
+        f"  Quantizing {len(quantize_names)} weight initializers "
+        f"(block_size={block_size})"
+    )
+
+    model = onnx.load(base_reduced_path)
+
+    # Mahalanobis initializers must never be quantized
+    mahal_exclude = get_mahal_initializer_names(model) if has_mahal else set()
+
+    count = apply_block_quantization(
+        model,
+        quant_dtype,
+        scale_dtype,
+        block_size=block_size,
+        exclude_names=mahal_exclude,
+        quantize_names=quantize_names,
+        # BF16 models: our custom bf16 conversion stores weights as bf16 but
+        # inserts Cast(bf16→fp32) nodes so computation runs in fp32.  The
+        # dequant subgraph must therefore also output fp32.
+        # FP16 models: onnxconverter_common rewrites ops to fp16 natively,
+        # so computation runs in fp16 and the dequant subgraph should match.
+        compute_dtype_is_fp32=(scale_dtype == TargetDtype.BF16),
+    )
+    print(f"  Applied per-block {quant_dtype.value} to {count} initializers")
+
+    # Shape inference for TensorRT compatibility
+    print(f"  Running shape inference...")
+    model = infer_shapes_for_tensorrt(model)
+
+    embed_class_metadata(model, class_names)
+    onnx.save(model, output_path)
+
+    # Verify
+    print(f"  Verifying {label} dynamic batch...")
+    verify_dynamic_batch(
+        output_path,
+        input_size=img_cfg.input_size,
+        num_classes=num_classes,
+        rng=np.random.default_rng(4),
+        label=label,
+        has_mahal=has_mahal,
+    )
+
+    # Quick output quality check
+    print(f"  Verifying {label} output vs fp32 (real image, logits)...")
     real_sample = get_real_sample(img_cfg)
     sess_fp32 = ort.InferenceSession(fp32_path)
-    sess_int8 = ort.InferenceSession(int8_path)
+    sess_q = ort.InferenceSession(output_path)
     fp32_out = sess_fp32.run(None, {"input": real_sample})[0]
-    int8_out = sess_int8.run(None, {"input": real_sample})[0]
-    compare_outputs(fp32_out, int8_out, label=f"fp32 vs {label}", warn_threshold=0.05)
+    q_out = sess_q.run(None, {"input": real_sample})[0]
+    compare_outputs(fp32_out, q_out, label=f"fp32 vs {label}", warn_threshold=0.05)
+
+    print(f"  {label} ONNX saved: {output_path}")
+
+
+# ──────────────────────────────────────────────
+# Sensitivity detection wrapper
+# ──────────────────────────────────────────────
+def run_sensitivity_detection(
+    fp32_path: str,
+    quant_dtype: QuantDtype,
+    scale_dtype: TargetDtype,
+    *,
+    block_size: int,
+    nrmse_threshold: float,
+    output_diff_threshold: float,
+    img_cfg: ImageConfig,
+    num_probe_samples: int,
+    has_mahal: bool = False,
+) -> list[str]:
+    """Run 2-stage sensitivity detection and return names safe to quantize.
+
+    Args:
+        fp32_path: Path to the fp32 ONNX model.
+        quant_dtype: Target quantization dtype.
+        scale_dtype: BF16 or FP16 for scale storage.
+        block_size: Block size.
+        nrmse_threshold: Stage 1 threshold.
+        output_diff_threshold: Stage 2 threshold.
+        img_cfg: Image config for loading probe samples.
+        num_probe_samples: Number of probe samples for Stage 2.
+        has_mahal: Whether model has Mahalanobis anomaly detection.
+
+    Returns:
+        List of initializer names that are safe to quantize.
+    """
+    # Load probe samples for Stage 2
+    probe_samples = load_eval_samples(img_cfg, num_probe_samples, calib_seed=99)
+
+    # Mahalanobis initializers are always excluded
+    fp32_model = onnx.load(fp32_path)
+    mahal_exclude = get_mahal_initializer_names(fp32_model) if has_mahal else set()
+
+    quantize_names, sensitive_names = find_sensitive_initializers(
+        fp32_path,
+        quant_dtype,
+        scale_dtype,
+        block_size=block_size,
+        exclude_names=mahal_exclude,
+        nrmse_threshold=nrmse_threshold,
+        output_diff_threshold=output_diff_threshold,
+        probe_samples=probe_samples,
+    )
+
+    return quantize_names
 
 
 # ──────────────────────────────────────────────
@@ -662,60 +559,76 @@ def export_int8_onnx(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Export .pt checkpoint to 5 ONNX variants: "
-            "fp32 / fp16 / bf16 / fp16+INT8 / bf16+INT8"
+            "Export .pt checkpoint to 7 ONNX variants: "
+            "fp32 / bf16 / fp16 / bf16+INT8 / bf16+FP8 / fp16+INT8 / fp16+FP8"
         )
     )
     parser.add_argument(
         "--checkpoint",
         type=str,
         required=True,
-        help="Path to a .pt checkpoint (e.g. model_best.pt)",
+        help="Path to a .pt checkpoint (e.g. model_best_with_mahal.pt)",
     )
     parser.add_argument(
         "--num-classes",
         type=int,
         default=None,
-        help="Number of classes. Auto-detected from arc_weight in checkpoint if omitted.",
-    )
-    parser.add_argument(
-        "--calib-samples",
-        type=int,
-        default=DEFAULT_CALIB_SAMPLES,
-        help="Number of calibration samples for INT8 quantization",
-    )
-    parser.add_argument(
-        "--eval-samples",
-        type=int,
-        default=DEFAULT_EVAL_SAMPLES,
-        help="Number of real samples for quality evaluation per variant",
+        help="Number of classes (auto-detected from checkpoint if omitted)",
     )
     parser.add_argument(
         "--opset",
         type=int,
         default=DEFAULT_OPSET,
-        help="ONNX opset version",
+        help=f"ONNX opset version (default: {DEFAULT_OPSET}, >=19 for FP8)",
+    )
+    # Block quantization parameters
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=DEFAULT_BLOCK_SIZE,
+        help=f"Block size for per-block quantization (default: {DEFAULT_BLOCK_SIZE})",
     )
     parser.add_argument(
-        "--calib-method",
-        choices=["minmax", "entropy", "percentile"],
-        default="minmax",
-        help=(
-            "Calibration method for INT8 static quantization. "
-            "'minmax' (default): fast, uses observed min/max. "
-            "'entropy': minimises KL-divergence between fp32 and INT8 distributions "
-            "(TensorRT-style, slower but typically more accurate). "
-            "'percentile': clips at --percentile cutoff to ignore outliers."
-        ),
+        "--fp8-format",
+        type=str,
+        default=DEFAULT_FP8_FORMAT,
+        choices=list(_FP8_FORMAT_MAP.keys()),
+        help=f"FP8 format (default: {DEFAULT_FP8_FORMAT})",
     )
+    # Sensitivity detection parameters
     parser.add_argument(
-        "--percentile",
+        "--nrmse-threshold",
         type=float,
-        default=99.999,
+        default=DEFAULT_WEIGHT_NRMSE_THRESHOLD,
         help=(
-            "Percentile cutoff used only when --calib-method=percentile. "
-            "E.g. 99.999 clips the top 0.001%% of activations before scaling."
+            f"Stage 1 NRMSE threshold for sensitivity detection "
+            f"(default: {DEFAULT_WEIGHT_NRMSE_THRESHOLD})"
         ),
+    )
+    parser.add_argument(
+        "--output-diff-threshold",
+        type=float,
+        default=DEFAULT_OUTPUT_DIFF_THRESHOLD,
+        help=(
+            f"Stage 2 max abs diff threshold for sensitivity detection "
+            f"(default: {DEFAULT_OUTPUT_DIFF_THRESHOLD})"
+        ),
+    )
+    parser.add_argument(
+        "--sensitivity-samples",
+        type=int,
+        default=DEFAULT_SENSITIVITY_SAMPLES,
+        help=(
+            f"Number of probe samples for Stage 2 sensitivity detection "
+            f"(default: {DEFAULT_SENSITIVITY_SAMPLES})"
+        ),
+    )
+    # Evaluation
+    parser.add_argument(
+        "--eval-samples",
+        type=int,
+        default=DEFAULT_EVAL_SAMPLES,
+        help=f"Number of samples for quality evaluation (default: {DEFAULT_EVAL_SAMPLES})",
     )
     return parser.parse_args()
 
@@ -731,15 +644,14 @@ def main():
         print(f"Error: checkpoint not found: {checkpoint_path}")
         sys.exit(1)
 
-    # Load architecture constants from the saved finetune_facenet.py copy
-    print(f"Loading run config from saved script next to checkpoint...")
+    # Load architecture constants
+    print("Loading run config from saved script next to checkpoint...")
     run_cfg = load_run_config(checkpoint_path)
     print(
         f"  backbone={run_cfg.backbone}  input_size={run_cfg.input_size}  "
         f"emb_size={run_cfg.emb_size}  backbone_dim={run_cfg.backbone_dim}"
     )
 
-    # Build ImageConfig for preprocessing / verification
     img_cfg = ImageConfig(
         input_size=run_cfg.input_size,
         mean=run_cfg.imagenet_mean,
@@ -751,61 +663,148 @@ def main():
 
     paths = {
         "fp32": os.path.join(out_dir, f"{stem}.onnx"),
-        "fp16": os.path.join(out_dir, f"{stem}_fp16.onnx"),
         "bf16": os.path.join(out_dir, f"{stem}_bf16.onnx"),
-        "fp16int8": os.path.join(out_dir, f"{stem}_fp16int8.onnx"),
+        "fp16": os.path.join(out_dir, f"{stem}_fp16.onnx"),
         "bf16int8": os.path.join(out_dir, f"{stem}_bf16int8.onnx"),
+        "bf16fp8": os.path.join(out_dir, f"{stem}_bf16fp8.onnx"),
+        "fp16int8": os.path.join(out_dir, f"{stem}_fp16int8.onnx"),
+        "fp16fp8": os.path.join(out_dir, f"{stem}_fp16fp8.onnx"),
     }
 
-    # Step 1: Load class names from dataset
+    fp8_quant_dtype = _FP8_FORMAT_MAP[args.fp8_format]
+    block_size = args.block_size
+
+    # ── Step 1: Load class names ──────────────────────────────────
     print("Loading class names from dataset...")
     class_names = get_class_names_from_dataset()
     num_classes = len(class_names)
     print(f"  {num_classes} class names loaded")
-
     meta = dict(num_classes=num_classes, class_names=class_names)
 
-    # Step 2: Load model
+    # ── Step 2: Load model ────────────────────────────────────────
     print(f"Loading checkpoint: {checkpoint_path}")
-    cls_model = load_classification_model(checkpoint_path, args.num_classes, run_cfg)
-
-    # Step 3: fp32 ONNX (base -- other variants derive from this)
-    export_fp32_onnx(
-        cls_model, paths["fp32"], opset=args.opset, img_cfg=img_cfg, **meta
+    cls_model, has_mahal = load_model_for_export(
+        checkpoint_path, args.num_classes, run_cfg
     )
 
-    # Step 4: fp16 full conversion
-    export_fp16_onnx(paths["fp32"], paths["fp16"], img_cfg=img_cfg, **meta)
-
-    # Step 5: bf16 full conversion
-    export_bf16_onnx(paths["fp32"], paths["bf16"], img_cfg=img_cfg, **meta)
-
-    # Step 6: fp16+INT8 quantization
-    export_int8_onnx(
+    # ── Step 3: FP32 ONNX (base) ─────────────────────────────────
+    export_fp32_onnx(
+        cls_model,
         paths["fp32"],
-        paths["fp16int8"],
-        calib_samples=args.calib_samples,
+        opset=args.opset,
         img_cfg=img_cfg,
-        residual_dtype="fp16",
-        calib_method=args.calib_method,
-        percentile=args.percentile,
+        has_mahal=has_mahal,
         **meta,
     )
 
-    # Step 7: bf16+INT8 quantization
-    export_int8_onnx(
+    # ── Step 4: BF16 ──────────────────────────────────────────────
+    export_bf16_onnx(
+        paths["fp32"],
+        paths["bf16"],
+        img_cfg=img_cfg,
+        has_mahal=has_mahal,
+        **meta,
+    )
+
+    # ── Step 5: FP16 ──────────────────────────────────────────────
+    export_fp16_onnx(
+        paths["fp32"],
+        paths["fp16"],
+        img_cfg=img_cfg,
+        has_mahal=has_mahal,
+        **meta,
+    )
+
+    # ── Step 6: Sensitivity detection ─────────────────────────────
+    # Run separately for INT8 and FP8 since they have different error profiles
+    print("\n" + "=" * 60)
+    print("Sensitivity detection for INT8")
+    print("=" * 60)
+    int8_quantize_names = run_sensitivity_detection(
+        paths["fp32"],
+        QuantDtype.INT8,
+        TargetDtype.BF16,  # scale dtype doesn't affect weight error
+        block_size=block_size,
+        nrmse_threshold=args.nrmse_threshold,
+        output_diff_threshold=args.output_diff_threshold,
+        img_cfg=img_cfg,
+        num_probe_samples=args.sensitivity_samples,
+        has_mahal=has_mahal,
+    )
+
+    print("\n" + "=" * 60)
+    print("Sensitivity detection for FP8")
+    print("=" * 60)
+    fp8_quantize_names = run_sensitivity_detection(
+        paths["fp32"],
+        fp8_quant_dtype,
+        TargetDtype.BF16,
+        block_size=block_size,
+        nrmse_threshold=args.nrmse_threshold,
+        output_diff_threshold=args.output_diff_threshold,
+        img_cfg=img_cfg,
+        num_probe_samples=args.sensitivity_samples,
+        has_mahal=has_mahal,
+    )
+
+    # ── Step 7: BF16 + INT8 ──────────────────────────────────────
+    export_block_quantized_onnx(
+        paths["bf16"],
         paths["fp32"],
         paths["bf16int8"],
-        calib_samples=args.calib_samples,
+        QuantDtype.INT8,
+        TargetDtype.BF16,
+        int8_quantize_names,
+        block_size=block_size,
         img_cfg=img_cfg,
-        residual_dtype="bf16",
-        calib_method=args.calib_method,
-        percentile=args.percentile,
+        has_mahal=has_mahal,
         **meta,
     )
 
-    # Step 8: Multi-sample quality evaluation for each variant
-    for label in ("fp16", "bf16", "fp16int8", "bf16int8"):
+    # ── Step 8: BF16 + FP8 ───────────────────────────────────────
+    export_block_quantized_onnx(
+        paths["bf16"],
+        paths["fp32"],
+        paths["bf16fp8"],
+        fp8_quant_dtype,
+        TargetDtype.BF16,
+        fp8_quantize_names,
+        block_size=block_size,
+        img_cfg=img_cfg,
+        has_mahal=has_mahal,
+        **meta,
+    )
+
+    # ── Step 9: FP16 + INT8 ──────────────────────────────────────
+    export_block_quantized_onnx(
+        paths["fp16"],
+        paths["fp32"],
+        paths["fp16int8"],
+        QuantDtype.INT8,
+        TargetDtype.FP16,
+        int8_quantize_names,
+        block_size=block_size,
+        img_cfg=img_cfg,
+        has_mahal=has_mahal,
+        **meta,
+    )
+
+    # ── Step 10: FP16 + FP8 ──────────────────────────────────────
+    export_block_quantized_onnx(
+        paths["fp16"],
+        paths["fp32"],
+        paths["fp16fp8"],
+        fp8_quant_dtype,
+        TargetDtype.FP16,
+        fp8_quantize_names,
+        block_size=block_size,
+        img_cfg=img_cfg,
+        has_mahal=has_mahal,
+        **meta,
+    )
+
+    # ── Step 11: Quality evaluation ──────────────────────────────
+    for label in ("bf16", "fp16", "bf16int8", "bf16fp8", "fp16int8", "fp16fp8"):
         evaluate_model_quality(
             paths["fp32"],
             paths[label],
@@ -814,7 +813,7 @@ def main():
             label=label,
         )
 
-    # Summary
+    # ── Summary ───────────────────────────────────────────────────
     print_file_sizes(paths)
     print("\nDone.")
 
