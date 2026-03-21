@@ -19,7 +19,7 @@ from tqdm import tqdm
 # ──────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────
-DATASET_NAME = "yayoimizuha/helloproject-face-webdatasets"
+DATASET_NAME = "yayoimizuha/helloproject-face-dataset"
 DEFAULT_CALIB_SAMPLES = 200
 DEFAULT_EVAL_SAMPLES = 50
 

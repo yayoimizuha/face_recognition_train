@@ -108,6 +108,44 @@ _RESIDUAL_DTYPE_MAP: dict[str, TargetDtype] = {
 # そのノードを除外候補とみなす。
 _SENSITIVITY_DIFF_THRESHOLD = 0.5
 
+# キャリブレーション手法マッピング。
+# CLI の --calib-method 文字列を CalibrationMethod に対応させる。
+_CALIB_METHOD_MAP: dict[str, CalibrationMethod] = {
+    "minmax": CalibrationMethod.MinMax,
+    "entropy": CalibrationMethod.Entropy,
+    "percentile": CalibrationMethod.Percentile,
+}
+
+
+def _build_calib_options(
+    calib_method: str,
+    percentile: float,
+    *,
+    activation_symmetric: bool = False,
+    weight_symmetric: bool = True,
+) -> tuple[CalibrationMethod, dict]:
+    """Return ``(CalibrationMethod, extra_options)`` for :func:`quantize_static`.
+
+    Args:
+        calib_method: One of ``"minmax"``, ``"entropy"``, ``"percentile"``.
+        percentile: Cutoff value used only when *calib_method* is
+            ``"percentile"`` (e.g. ``99.999``).
+        activation_symmetric: Passed to ``extra_options["ActivationSymmetric"]``.
+        weight_symmetric: Passed to ``extra_options["WeightSymmetric"]``.
+
+    Returns:
+        A 2-tuple ``(method, extra_options)`` ready to unpack into
+        ``quantize_static``.
+    """
+    method = _CALIB_METHOD_MAP[calib_method]
+    extra: dict = {
+        "ActivationSymmetric": activation_symmetric,
+        "WeightSymmetric": weight_symmetric,
+    }
+    if calib_method == "percentile":
+        extra["PercentileCalibrationValue"] = percentile
+    return method, extra
+
 
 # ──────────────────────────────────────────────
 # Classification wrapper for ONNX export
@@ -230,6 +268,8 @@ def _find_sensitive_nodes(
     calib_samples: list[np.ndarray],
     *,
     threshold: float = _SENSITIVITY_DIFF_THRESHOLD,
+    calib_method: str = "minmax",
+    percentile: float = 99.999,
 ) -> list[str]:
     """Identify Conv/Gemm nodes that degrade badly under INT8 quantization.
 
@@ -247,6 +287,10 @@ def _find_sensitive_nodes(
         img_cfg: Image config (used only for shape information in error messages).
         calib_samples: Small list of calibration numpy arrays ``(1,3,H,W)``.
         threshold: Max-abs-diff threshold above which a node is sensitive.
+        calib_method: Calibration method (``"minmax"``, ``"entropy"``,
+            ``"percentile"``).  Passed to the single-node probe so the scan
+            uses the same statistics strategy as the full quantization.
+        percentile: Cutoff used only when *calib_method* is ``"percentile"``.
 
     Returns:
         List of node names to exclude from quantization.
@@ -273,6 +317,7 @@ def _find_sensitive_nodes(
     sensitive: list[str] = []
 
     with tempfile.TemporaryDirectory() as tmp_dir:
+        _probe_method, _probe_extra = _build_calib_options(calib_method, percentile)
         for node in candidate_nodes:
             node_name = node.name
             tmp_path = os.path.join(tmp_dir, "single_node_quant.onnx")
@@ -292,11 +337,8 @@ def _find_sensitive_nodes(
                     reduce_range=False,
                     op_types_to_quantize=["Conv", "Gemm"],
                     nodes_to_quantize=[node_name],
-                    calibrate_method=CalibrationMethod.MinMax,
-                    extra_options={
-                        "ActivationSymmetric": False,
-                        "WeightSymmetric": True,
-                    },
+                    calibrate_method=_probe_method,
+                    extra_options=_probe_extra,
                 )
             except Exception as e:
                 # If quantizing this single node fails outright, exclude it
@@ -499,6 +541,8 @@ def export_int8_onnx(
     num_classes: int,
     class_names: list[str],
     residual_dtype: str = "fp16",
+    calib_method: str = "minmax",
+    percentile: float = 99.999,
 ) -> None:
     """Produce an INT8 statically-quantized model from the fp32 base.
 
@@ -506,10 +550,20 @@ def export_int8_onnx(
     INT8 output against fp32; nodes with large divergence are excluded.
     Residual (non-quantized) weights are compressed to *residual_dtype*
     ("fp16"/"bf16").
+
+    Args:
+        calib_method: One of ``"minmax"`` (default), ``"entropy"``,
+            ``"percentile"``.  Both the sensitivity scan and the final
+            quantization pass use the same method for consistency.
+        percentile: Cutoff used only when *calib_method* is ``"percentile"``.
     """
     label = f"INT8+{residual_dtype}"
     print(f"Running {label} quantization with calibration...")
     print(f"  calibration samples: {calib_samples}")
+    print(
+        f"  calibration method:  {calib_method}"
+        + (f" (percentile={percentile})" if calib_method == "percentile" else "")
+    )
     print(f"  quantized op types: {OP_TYPES_TO_QUANTIZE}")
 
     # Pre-process: shape inference + model optimization
@@ -530,9 +584,12 @@ def export_int8_onnx(
         preprocessed_path,
         img_cfg,
         probe_samples,
+        calib_method=calib_method,
+        percentile=percentile,
     )
     print(f"  Excluding {len(nodes_to_exclude)} sensitive nodes from quantization")
 
+    calib_method_enum, extra_options = _build_calib_options(calib_method, percentile)
     calib_reader.rewind()
     quantize_static(
         model_input=preprocessed_path,
@@ -545,11 +602,8 @@ def export_int8_onnx(
         reduce_range=False,
         op_types_to_quantize=OP_TYPES_TO_QUANTIZE,
         nodes_to_exclude=nodes_to_exclude,
-        calibrate_method=CalibrationMethod.MinMax,
-        extra_options={
-            "ActivationSymmetric": False,
-            "WeightSymmetric": True,
-        },
+        calibrate_method=calib_method_enum,
+        extra_options=extra_options,
     )
 
     # Clean up intermediate file
@@ -642,6 +696,27 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OPSET,
         help="ONNX opset version",
     )
+    parser.add_argument(
+        "--calib-method",
+        choices=["minmax", "entropy", "percentile"],
+        default="minmax",
+        help=(
+            "Calibration method for INT8 static quantization. "
+            "'minmax' (default): fast, uses observed min/max. "
+            "'entropy': minimises KL-divergence between fp32 and INT8 distributions "
+            "(TensorRT-style, slower but typically more accurate). "
+            "'percentile': clips at --percentile cutoff to ignore outliers."
+        ),
+    )
+    parser.add_argument(
+        "--percentile",
+        type=float,
+        default=99.999,
+        help=(
+            "Percentile cutoff used only when --calib-method=percentile. "
+            "E.g. 99.999 clips the top 0.001%% of activations before scaling."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -712,6 +787,8 @@ def main():
         calib_samples=args.calib_samples,
         img_cfg=img_cfg,
         residual_dtype="fp16",
+        calib_method=args.calib_method,
+        percentile=args.percentile,
         **meta,
     )
 
@@ -722,6 +799,8 @@ def main():
         calib_samples=args.calib_samples,
         img_cfg=img_cfg,
         residual_dtype="bf16",
+        calib_method=args.calib_method,
+        percentile=args.percentile,
         **meta,
     )
 

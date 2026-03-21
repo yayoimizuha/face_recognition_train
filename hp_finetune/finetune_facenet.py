@@ -1,5 +1,5 @@
 """
-Fine-tuning script for face recognition using the helloproject-face-webdatasets dataset.
+Fine-tuning script for face recognition using the helloproject-face-dataset dataset.
 Single GPU, ArcFace loss, MobileNetV4-Hybrid-Medium backbone with GWAP.
 
 Architecture:
@@ -330,7 +330,7 @@ def main():
 
     # Load dataset
     print("Loading dataset...")
-    raw = load_dataset("yayoimizuha/helloproject-face-webdatasets")
+    raw = load_dataset("yayoimizuha/helloproject-face-dataset")
     train_data = raw["train"]
 
     # ClassLabel feature があればその names を信頼する。

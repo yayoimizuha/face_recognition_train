@@ -12,7 +12,7 @@
 
 ## finetune_facenet.py — ファインチューニング
 
-HuggingFace データセット (`yayoimizuha/helloproject-face-webdatasets`) を使い、
+HuggingFace データセット (`yayoimizuha/helloproject-face-dataset`) を使い、
 MobileNetV4-Hybrid-Medium + GWAP + ArcFace でファインチューニングを行う。
 
 ### 基本的な使い方
@@ -73,6 +73,16 @@ python hp_finetune/export_onnx.py \
 | `--calib-samples` | 64 | INT8 量子化のキャリブレーションサンプル数 |
 | `--eval-samples` | 32 | 各バリアントの品質評価サンプル数 |
 | `--opset` | 18 | ONNX opset バージョン |
+| `--calib-method` | `minmax` | INT8 キャリブレーション手法（`minmax` / `entropy` / `percentile`） |
+| `--percentile` | 99.999 | `--calib-method percentile` 使用時のクリッピングパーセンタイル値 |
+
+#### `--calib-method` の選択基準
+
+| 手法 | 計算コスト | 精度 | 説明 |
+|---|---|---|---|
+| `minmax` | 低 | 中 | 観測した最小・最大値をそのままスケールに使う（デフォルト） |
+| `entropy` | 中〜高 | 高 | fp32 と INT8 の出力分布の KL ダイバージェンスを最小化する（TensorRT 相当） |
+| `percentile` | 低 | 中〜高 | `--percentile` で指定したパーセンタイル値でクリッピングし外れ値の影響を排除する |
 
 ### 出力
 
