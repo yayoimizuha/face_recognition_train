@@ -13,7 +13,9 @@
 ## finetune_facenet.py — ファインチューニング
 
 HuggingFace データセット (`yayoimizuha/helloproject-face-dataset`) を使い、
-MobileNetV4-Hybrid-Medium + GWAP + ArcFace でファインチューニングを行う。
+FastViT-S12 + GWAP + ArcFace でファインチューニングを行う。
+ArcFace 学習後、`yayoimizuha/helloproject-face-errors` と `tonyassi/celebrity-1000` を
+負例として `AnomalyClassifier`（二値分類器）を追加学習する。
 
 ### 基本的な使い方
 
@@ -34,7 +36,7 @@ python hp_finetune/finetune_facenet.py
 | ファイル | 内容 |
 |---|---|
 | `model_best.pt` | 検証精度が最も高かったエポックの重み |
-| `model_best_with_mahal.pt` | `model_best.pt` にマハラノビス異常検知の統計量（mean / precision / threshold）を追加したもの |
+| `model_best_with_anomaly.pt` | `model_best.pt` に `AnomalyClassifier`（二値分類器）を追加学習した最終モデル |
 | `model_final.pt` | 最終エポックの重み |
 | `model_epochN.pt` | `SAVE_INTERVAL` ごとの定期チェックポイント |
 | `confusion_matrix.png` | 学習データ全体での混同行列 |
@@ -44,15 +46,19 @@ python hp_finetune/finetune_facenet.py
 
 | 定数 | デフォルト値 | 説明 |
 |---|---|---|
-| `NUM_EPOCHS` | 200 | 学習エポック数 |
+| `NUM_EPOCHS` | 150 | ArcFace 学習エポック数 |
 | `BATCH_SIZE` | 128 | バッチサイズ |
-| `LR` | 2e-3 | head / GWAP / ArcFace の学習率 |
-| `LR_BACKBONE` | 2e-4 | backbone の学習率 |
+| `LR` | 3e-3 | head / GWAP / ArcFace の学習率 |
+| `LR_BACKBONE` | 3e-4 | backbone の学習率 |
 | `EMB_SIZE` | 512 | 埋め込みベクトルの次元数 |
 | `VAL_RATIO` | 0.2 | 検証データの割合 |
 | `USE_AMP` | `True` | 混合精度学習の有効化 |
 | `AMP_DTYPE` | `"bf16"` | AMP の dtype（`"bf16"` または `"fp16"`） |
-| `MAHAL_REG_LAMBDA` | 1e-5 | マハラノビス共分散行列の正則化係数（下限値。実際は `trace(Σ)/D × 1e-3` と比較して大きい方が使われる） |
+| `ANOMALY_HIDDEN_DIM` | 256 | AnomalyClassifier 中間層の次元数 |
+| `ANOMALY_DROPOUT` | 0.3 | AnomalyClassifier の Dropout 率 |
+| `ANOMALY_LR` | 1e-3 | AnomalyClassifier の学習率 |
+| `ANOMALY_EPOCHS` | 20 | AnomalyClassifier の学習エポック数 |
+| `CELEBRITY_NEG_SAMPLES` | 3000 | 負例として使う `tonyassi/celebrity-1000` のサンプル数 |
 
 #### `AMP_DTYPE` の選択基準
 
@@ -63,7 +69,7 @@ python hp_finetune/finetune_facenet.py
 
 > **注意:** `"fp16"` では backbone の activation が 65504 を超えると Inf が発生し、
 > `BatchNorm1d` の `running_mean` / `running_var` が NaN に汚染される。
-> 汚染が起きると eval 時に `embed()` が NaN を返し、マハラノビス距離の計算が失敗する。
+> 汚染が起きると eval 時に `embed()` が NaN を返し、AnomalyClassifier の異常スコア計算が失敗する。
 > Ampere 以降の GPU では必ず `"bf16"` を使用すること。
 
 ---
@@ -83,7 +89,7 @@ DequantizeLinear を使わず標準 ONNX ノード（Cast, Mul, Reshape, Slice�
 
 ```bash
 python hp_finetune/export_onnx.py \
-    --checkpoint hp_finetune/work_dirs/<タイムスタンプ>/model_best_with_mahal.pt
+    --checkpoint hp_finetune/work_dirs/<タイムスタンプ>/model_best_with_anomaly.pt
 ```
 
 ### オプション
@@ -107,8 +113,8 @@ python hp_finetune/export_onnx.py \
 | ファイル名 | ウェイト | 計算 dtype | 説明 |
 |---|---|---|---|
 | `<stem>.onnx` | fp32 | fp32 | 基本モデル（他の全バリアントのベース） |
-| `<stem>_bf16.onnx` | bf16 | bf16 | グラフ全体 bf16 化（Mahalanobis は fp32 維持） |
-| `<stem>_fp16.onnx` | fp16 | fp16 | グラフ全体 fp16 化（Mahalanobis は fp32 維持） |
+| `<stem>_bf16.onnx` | bf16 | bf16 | グラフ全体 bf16 化（AnomalyClassifier は fp32 維持） |
+| `<stem>_fp16.onnx` | fp16 | fp16 | グラフ全体 fp16 化（AnomalyClassifier は fp32 維持） |
 | `<stem>_bf16int8.onnx` | INT8 per-block | bf16 | INT8 量子化ウェイト + bf16 スケール |
 | `<stem>_bf16fp8.onnx` | FP8 per-block | bf16 | FP8 量子化ウェイト + bf16 スケール |
 | `<stem>_fp16int8.onnx` | INT8 per-block | fp16 | INT8 量子化ウェイト + fp16 スケール |
@@ -146,13 +152,13 @@ weight_quantized [int8/fp8, (num_blocks, block_size)]
 - 出力は **分類ロジット** `(batch_size, num_classes)`
 - 確率が必要な場合は消費側で softmax を適用する
 
-**分類 + 異常検知 (`model_best_with_mahal.pt` から生成した場合)**
+**分類 + 異常検知 (`model_best_with_anomaly.pt` から生成した場合)**
 
 - 出力テンソルが **2つ** になる
   - `logits`        : `(batch_size, num_classes)` — 分類ロジット（上と同じ）
-  - `anomaly_score` : `(batch_size,)` — マハラノビス距離（大きいほど異常）
-- `mahal_threshold` がメタデータに埋め込まれており、`anomaly_score > threshold` で異常判定できる
-- マハラノビス関連ノード・イニシャライザは常に fp32 で維持される
+  - `anomaly_score` : `(batch_size,)` — 異常スコア（sigmoid 出力、0〜1。大きいほど異常）
+- `anomaly_threshold` がメタデータに埋め込まれており、`anomaly_score > threshold` で異常判定できる
+- AnomalyClassifier ノード・イニシャライザは常に fp32 で維持される
 
 バッチサイズは動的（任意のバッチサイズで推論可能）
 
@@ -187,6 +193,8 @@ python hp_finetune/infer_onnx.py \
 |---|---|---|
 | `--onnx` | (必須) | ONNX モデルのパス |
 | `--output-dir` | `<onnx_dir>/infer_results/<stem>` | 結果の保存先ディレクトリ |
+| `--batch-size` | 32 | ONNX 推論のバッチサイズ |
+| `--max-samples` | 全サンプル | 学習データセットから処理するサンプル数の上限 |
 | `--top-k` | 20 | 混同上位ペアの表示件数 |
 | `--top-class-k` | 0 | サマリに表示するクラス別精度の行数（精度昇順・worst first）。0 = 全クラス表示 |
 | `--provider` | `auto` | 実行プロバイダー（`auto` / `cpu` / `cuda` / `tensorrt`） |
@@ -203,10 +211,11 @@ python hp_finetune/infer_onnx.py \
 
 | ファイル／ディレクトリ | 内容 |
 |---|---|
-| `wrong_predictions.csv` | 誤分類サンプルの一覧（index、真ラベル、予測ラベル、確信度、画像パス） |
+| `wrong_predictions.csv` | 誤分類サンプルの一覧（index、真ラベル、予測ラベル、確信度） |
 | `confusion_ranking.csv` | 誤分類ペア `(true_class, pred_class, count)` の件数降順ランキング |
 | `class_accuracy.csv` | クラスごとの正解率（昇順ソート、最も混同されやすいクラスが先頭） |
-| `wrong_images/<pred_class>/<true_class>_NNN.jpg` | 誤分類された元画像 |
+| `errors_predictions.csv` | `helloproject-face-errors` データセットの推論結果（正解ラベルなし） |
+| `distribution_anomaly_score.png` | 異常スコアの分布ヒストグラム（学習データ正例 vs errors 負例）
 
 ---
 
@@ -214,8 +223,8 @@ python hp_finetune/infer_onnx.py \
 
 ```
 1. finetune_facenet.py  →  work_dirs/<timestamp>/model_best.pt
-                                                  model_best_with_mahal.pt
-2. export_onnx.py       →  work_dirs/<timestamp>/model_best_with_mahal.onnx（他 6 バリアント）
+                                                  model_best_with_anomaly.pt
+2. export_onnx.py       →  work_dirs/<timestamp>/model_best_with_anomaly.onnx（他 6 バリアント）
 3. infer_onnx.py        →  work_dirs/<timestamp>/infer_results/<stem>/
 ```
 
@@ -250,7 +259,7 @@ python hp_finetune/infer_onnx.py \
 
 - outdated 版のグラフ操作ユーティリティを移植・改良
 - BF16/FP16 全グラフ変換（`convert_graph_to_bf16`, `convert_graph_to_fp16`）
-- マハラノビスノード特定・イニシャライザ復元機能
+- AnomalyClassifier ノード特定・イニシャライザ復元機能
 
 #### `ARCHITECTURE.md` — 新規作成
 
@@ -264,23 +273,17 @@ python hp_finetune/infer_onnx.py \
   - H200（Hopper）では bf16 の Tensor Core 速度は fp16 と同等のため速度低下なし
 - **`GradScaler` を bf16 時は自動無効化**（`_use_scaler = USE_AMP and AMP_DTYPE == "fp16"`）
   - bf16 はオーバーフローしないため gradient scaling が不要
-- **マハラノビス共分散行列の計算を float64 で実施**
-  - float32 で 51k × 512 の外積を累積すると丸め誤差が 51k 倍蓄積し、精度行列の条件数が 1e8 を超えて `linalg.inv` が NaN を返す問題があった
-  - float64（機械イプシロン ~2e-16）で計算後、float32 に変換してバッファに書き込む
-- **正則化係数 λ の自動スケーリング**（`adaptive_lambda = max(trace(Σ)/D × 1e-3, reg_lambda)`）
-  - 固定値 1e-5 は embedding の分散スケールに対して小さすぎて共分散行列の最小固有値を十分に押し上げられなかった
-  - `trace(Σ)/D × 1e-3`（平均分散の 0.1%）を下限として embedding スケールに追従する
 
 ### 2026-03-21
 
 #### `export_onnx.py`
 - モデル再構築時に `DROPOUT` / `ARC_S` / `ARC_M` を saved script から読んだ値 (`run_cfg`) で正しく渡すよう修正（コンストラクタのデフォルト値との不一致を解消）
 - fp32 ONNX エクスポート時に `input_size` / `imagenet_mean` / `imagenet_std` を `metadata_props` に書き込むよう追加（`infer_onnx.py` がハードコードデフォルトにフォールバックしなくなる）
-- `export_fp16_onnx` / `export_bf16_onnx` / `export_int8_onnx` に `has_mahal` パラメータを追加し、`verify_dynamic_batch` に伝搬
+- `export_fp16_onnx` / `export_bf16_onnx` / `export_int8_onnx` に `has_anomaly` パラメータを追加し、`verify_dynamic_batch` に伝搬
 - NaN 判定を `x != x` イディオムから `math.isnan(x)` に変更
 
 #### `verification.py`
-- `verify_dynamic_batch` に `has_mahal: bool = False` パラメータを追加。`True` のとき `outputs[1]` (anomaly_score) の shape `(bs,)` も検証する
+- `verify_dynamic_batch` に `has_anomaly: bool = False` パラメータを追加。`True` のとき `outputs[1]` (anomaly_score) の shape `(bs,)` も検証する
 - `DEFAULT_EVAL_SAMPLES` の重複定義を削除し、`data_utils.py` からインポートに統一
 
 #### `infer_onnx.py`

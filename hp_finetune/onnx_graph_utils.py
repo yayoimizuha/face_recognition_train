@@ -5,7 +5,7 @@ Provides helpers for:
 - Fixing hardcoded Reshape nodes
 - Merging external data
 - Embedding class metadata
-- Identifying Mahalanobis-exclusive nodes
+- Identifying AnomalyClassifier-exclusive nodes
 - Shape inference for TensorRT compatibility
 - Full-graph fp16/bf16 conversion (activation + weight)
 """
@@ -49,6 +49,35 @@ def make_batch_dim_dynamic(
                 dim0 = shape.dim[0]
                 dim0.ClearField("dim_value")
                 dim0.dim_param = dim_name
+
+
+def make_intermediate_batch_dims_dynamic(
+    model: onnx.ModelProto, dim_name: str = "batch_size"
+) -> int:
+    """Rewrite the leading dim of all intermediate ``value_info`` tensors to symbolic.
+
+    ``onnxconverter_common.float16.convert_float_to_float16`` runs shape inference
+    with a batch-1 input, which may record ``dim_value=1`` on intermediate tensors
+    (e.g. the output of ReduceMin on the AnomalyClassifier anomaly_score path).  At
+    runtime with batch > 1, the executor attempts to re-use the pre-allocated
+    ``{1}`` buffer for a ``{N}`` output, causing a RuntimeException.
+
+    This function scans ``model.graph.value_info`` and replaces any positive fixed
+    ``dim_value`` on the first dimension with ``dim_param``, making all intermediate
+    shapes batch-dynamic.
+
+    Returns the number of value_info entries patched.
+    """
+    count = 0
+    for vi in model.graph.value_info:
+        shape = vi.type.tensor_type.shape
+        if shape and len(shape.dim) > 0:
+            dim0 = shape.dim[0]
+            if dim0.HasField("dim_value") and dim0.dim_value > 0:
+                dim0.ClearField("dim_value")
+                dim0.dim_param = dim_name
+                count += 1
+    return count
 
 
 # ──────────────────────────────────────────────
@@ -182,14 +211,14 @@ def embed_class_metadata(model: onnx.ModelProto, class_names: list[str]) -> None
 
 
 # ──────────────────────────────────────────────
-# Mahalanobis node identification
+# AnomalyClassifier node identification
 # ──────────────────────────────────────────────
-def get_mahal_exclusive_nodes(model: onnx.ModelProto) -> list[str]:
-    """Return node names that are exclusive to the Mahalanobis anomaly_score path.
+def get_anomaly_exclusive_nodes(model: onnx.ModelProto) -> list[str]:
+    """Return node names that are exclusive to the AnomalyClassifier anomaly_score path.
 
     These are nodes that appear in the ancestor set of ``anomaly_score`` but NOT
-    in the ancestor set of ``logits``.  They implement the Mahalanobis distance
-    computation (Sub, MatMul, Mul, ReduceSum, Clip, Sqrt) on the raw embedding.
+    in the ancestor set of ``logits``.  They implement the AnomalyClassifier
+    computation (Linear, BatchNorm, ReLU, Sigmoid) on the GWAP output.
 
     When an ONNX model has no ``anomaly_score`` output this returns an empty list.
     """
@@ -223,32 +252,31 @@ def get_mahal_exclusive_nodes(model: onnx.ModelProto) -> list[str]:
     return [n for n in anomaly_nodes if n not in logits_nodes]
 
 
-def get_mahal_initializer_names(model: onnx.ModelProto) -> set[str]:
-    """Return names of Mahalanobis-related initializers.
+def get_anomaly_initializer_names(model: onnx.ModelProto) -> set[str]:
+    """Return names of AnomalyClassifier-related initializers.
 
     These should be excluded from reduced-precision conversion to maintain
-    anomaly detection accuracy.  Includes ``mahal_class_means``, ``mahal_precision``,
-    and ``mahal_threshold``.
+    anomaly detection accuracy.  Matches initializers prefixed with
+    ``anomaly_fc1_``, ``anomaly_fc2_``, ``anomaly_bn1_``, or ``anomaly_threshold``.
     """
     names: set[str] = set()
     for init in model.graph.initializer:
-        if init.name.startswith("mahal_"):
+        if init.name.startswith("anomaly_"):
             names.add(init.name)
     return names
 
 
 # ──────────────────────────────────────────────
-# Restore Mahalanobis initializers to fp32
+# Restore AnomalyClassifier initializers to fp32
 # ──────────────────────────────────────────────
-def restore_mahal_initializers_to_fp32(
+def restore_anomaly_initializers_to_fp32(
     model: onnx.ModelProto,
     fp32_model: onnx.ModelProto,
 ) -> int:
-    """Restore ``mahal_class_means`` and ``mahal_precision`` initializers to fp32.
+    """Restore AnomalyClassifier weight initializers to fp32.
 
-    After fp16/bf16 conversion these buffers may be clipped or lose precision,
-    causing the Mahalanobis distance to overflow / underflow.  This function
-    replaces them with the original fp32 values.
+    After fp16/bf16 conversion these weights may lose precision.
+    This function replaces them with the original fp32 values.
 
     Returns the number of initializers restored.
     """
@@ -256,10 +284,10 @@ def restore_mahal_initializers_to_fp32(
         init.name: onnx_numpy_helper.to_array(init)
         for init in fp32_model.graph.initializer
     }
-    mahal_names = {"mahal_class_means", "mahal_precision"}
+    anomaly_names = get_anomaly_initializer_names(fp32_model)
     count = 0
     for i, init in enumerate(model.graph.initializer):
-        if init.name in mahal_names and init.name in fp32_inits:
+        if init.name in anomaly_names and init.name in fp32_inits:
             fp32_arr = fp32_inits[init.name].astype(np.float32)
             new_init = onnx_numpy_helper.from_array(fp32_arr, name=init.name)
             model.graph.initializer[i].CopyFrom(new_init)
@@ -273,46 +301,54 @@ def restore_mahal_initializers_to_fp32(
 def convert_graph_to_fp16(
     fp32_model: onnx.ModelProto,
     *,
-    has_mahal: bool = False,
+    has_anomaly: bool = False,
 ) -> onnx.ModelProto:
     """Convert entire graph (weights + activations) to fp16.
 
     Uses ``onnxconverter_common.float16`` for reliable activation + weight
     conversion.  I/O tensors stay fp32 (``keep_io_types=True``).
 
-    When ``has_mahal=True``:
-    - Mahalanobis-exclusive nodes are kept in fp32 via ``node_block_list``
-    - ``mahal_class_means`` / ``mahal_precision`` initializers are restored to fp32
+    When ``has_anomaly=True``:
+    - AnomalyClassifier-exclusive nodes are kept in fp32 via ``node_block_list``
+    - AnomalyClassifier weight initializers are restored to fp32
 
     Args:
         fp32_model: Original fp32 model (not modified).
-        has_mahal: Whether the model has Mahalanobis anomaly detection.
+        has_anomaly: Whether the model has AnomalyClassifier.
 
     Returns:
         A new ModelProto with fp16 weights and activations.
     """
     from onnxconverter_common import float16 as onnx_float16
 
-    # Identify Mahalanobis nodes to block from fp16 conversion
-    mahal_node_block: list[str] = []
-    if has_mahal:
-        mahal_node_block = get_mahal_exclusive_nodes(fp32_model)
-        if mahal_node_block:
-            print(f"  Keeping {len(mahal_node_block)} Mahalanobis nodes in fp32")
+    # Identify AnomalyClassifier nodes to block from fp16 conversion
+    anomaly_node_block: list[str] = []
+    if has_anomaly:
+        anomaly_node_block = get_anomaly_exclusive_nodes(fp32_model)
+        if anomaly_node_block:
+            print(
+                f"  Keeping {len(anomaly_node_block)} AnomalyClassifier nodes in fp32"
+            )
 
     fp16_model = onnx_float16.convert_float_to_float16(
         copy.deepcopy(fp32_model),
         keep_io_types=True,
         disable_shape_infer=False,
         check_fp16_ready=False,
-        node_block_list=mahal_node_block if mahal_node_block else None,
+        node_block_list=anomaly_node_block if anomaly_node_block else None,
     )
 
-    # Restore Mahalanobis initializers to fp32
-    if has_mahal:
-        restored = restore_mahal_initializers_to_fp32(fp16_model, fp32_model)
+    # Restore AnomalyClassifier initializers to fp32
+    if has_anomaly:
+        restored = restore_anomaly_initializers_to_fp32(fp16_model, fp32_model)
         if restored:
-            print(f"  Restored {restored} Mahalanobis initializer(s) to fp32")
+            print(f"  Restored {restored} AnomalyClassifier initializer(s) to fp32")
+
+    # Fix intermediate value_info batch dims hardcoded to 1 by shape inference
+    # inside onnxconverter_common (affects ReduceMin on the anomaly_score path).
+    fixed = make_intermediate_batch_dims_dynamic(fp16_model)
+    if fixed:
+        print(f"  Fixed {fixed} intermediate value_info batch dims to dynamic")
 
     return fp16_model
 
@@ -323,7 +359,7 @@ def convert_graph_to_fp16(
 def convert_graph_to_bf16(
     fp32_model: onnx.ModelProto,
     *,
-    has_mahal: bool = False,
+    has_anomaly: bool = False,
 ) -> onnx.ModelProto:
     """Convert entire graph weights to bf16 (stored as bf16, Cast to fp32 at runtime).
 
@@ -333,12 +369,12 @@ def convert_graph_to_bf16(
     clipping risk.  However the reduced mantissa (7 bits) introduces ~0.8%
     relative error per element.
 
-    When ``has_mahal=True``:
-    - ``mahal_class_means`` / ``mahal_precision`` are restored to fp32
+    When ``has_anomaly=True``:
+    - AnomalyClassifier weight initializers are restored to fp32
 
     Args:
         fp32_model: Original fp32 model (not modified).
-        has_mahal: Whether the model has Mahalanobis anomaly detection.
+        has_anomaly: Whether the model has AnomalyClassifier.
 
     Returns:
         A new ModelProto with bf16 weights (activations compute via Cast nodes).
@@ -347,24 +383,24 @@ def convert_graph_to_bf16(
 
     bf16_model = copy.deepcopy(fp32_model)
 
-    # Exclude mahal initializers from bf16 conversion
-    mahal_names = get_mahal_initializer_names(bf16_model) if has_mahal else set()
+    # Exclude AnomalyClassifier initializers from bf16 conversion
+    anomaly_names = get_anomaly_initializer_names(bf16_model) if has_anomaly else set()
 
     converted = convert_initializers(
         bf16_model,
         TargetDtype.BF16,
         min_elements=0,
         exclude_quant_params=False,
-        exclude_names=mahal_names,
+        exclude_names=anomaly_names,
     )
     print(f"  Converted {converted} initializers to bf16")
 
-    # Restore mahal initializers just in case (shouldn't be needed since we
+    # Restore anomaly initializers just in case (shouldn't be needed since we
     # excluded them, but as a safety net)
-    if has_mahal:
-        restored = restore_mahal_initializers_to_fp32(bf16_model, fp32_model)
+    if has_anomaly:
+        restored = restore_anomaly_initializers_to_fp32(bf16_model, fp32_model)
         if restored:
-            print(f"  Restored {restored} Mahalanobis initializer(s) to fp32")
+            print(f"  Restored {restored} AnomalyClassifier initializer(s) to fp32")
 
     return bf16_model
 

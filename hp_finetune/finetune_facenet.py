@@ -1,16 +1,17 @@
 """
 Fine-tuning script for face recognition using the helloproject-face-dataset dataset.
-Single GPU, ArcFace loss, MobileNetV4-Hybrid-Medium backbone with GWAP.
+Single GPU, ArcFace loss, FastViT-S12 backbone with GWAP.
 
 Architecture:
-    backbone (timm mobilenetv4_hybrid_medium features) → GWAP → Linear+BN+SiLU+Dropout → Linear → embedding
+    backbone (timm fastvit_s12 features) → GWAP → Linear+BN+SiLU+Dropout → Linear → embedding
 
-After ArcFace training, Mahalanobis distance-based anomaly detection is fitted:
+After ArcFace training, a lightweight binary anomaly classifier is fitted:
+    - Input feature: GWAP output (1024-dim backbone features, before the embedding head)
     - Positive examples: yayoimizuha/helloproject-face-dataset (all samples)
-    - Negative examples: yayoimizuha/helloproject-face-errors (for threshold calibration)
-    - Statistics (mean, precision matrix, threshold) are stored as nn.Buffers inside the model.
+    - Negative examples: yayoimizuha/helloproject-face-errors
+                       + tonyassi/celebrity-1000 (CELEBRITY_NEG_SAMPLES samples)
+    - Classifier (threshold) is stored as nn.Buffer inside the model.
     - In eval mode, forward() returns (cos_logits, anomaly_score) tuple.
-    - Mahalanobis distance is computed on raw (non-normalized) embeddings for maximum precision.
 
 Usage:
     python hp_finetune/finetune_facenet.py
@@ -49,8 +50,8 @@ from tqdm import tqdm
 # ──────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────
-BACKBONE = "timm/mobilenetv4_hybrid_medium.e500_r224_in1k"
-BACKBONE_DIM = 960  # mobilenetv4_hybrid_medium の forward_features 出力チャンネル数
+BACKBONE = "timm/fastvit_s12.apple_in1k"
+BACKBONE_DIM = 1024  # fastvit_s12 の forward_features 出力チャンネル数
 HIDDEN_DIM = 1024  # embedding head の中間層次元
 EMB_SIZE = 512
 INPUT_SIZE = 224  # 事前学習時と同じ解像度
@@ -75,8 +76,12 @@ SAVE_INTERVAL = 10  # この epoch 間隔でもチェックポイントを保存
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "work_dirs")
 WANDB_PROJECT = "face-recognition-finetune"
 
-# Mahalanobis 異常検知設定
-MAHAL_REG_LAMBDA = 1e-5  # 共分散行列の正則化項 (特異行列回避)
+# 異常検知分類器設定
+ANOMALY_HIDDEN_DIM = 256  # AnomalyClassifier 中間層次元
+ANOMALY_DROPOUT = 0.3  # AnomalyClassifier Dropout 率
+ANOMALY_LR = 1e-3  # AnomalyClassifier 学習率
+ANOMALY_EPOCHS = 20  # AnomalyClassifier 学習エポック数
+CELEBRITY_NEG_SAMPLES = 3000  # tonyassi/celebrity-1000 から使う負例サンプル数
 
 # ImageNet 正規化統計量（事前学習済みモデルに合わせる）
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -179,58 +184,65 @@ class GWAP(nn.Module):
 
 
 # ──────────────────────────────────────────────
-# Mahalanobis Distance Layer
+# Anomaly Classifier
 # ──────────────────────────────────────────────
-class MahalanobisLayer(nn.Module):
-    """Multi-class マハラノビス距離計算モジュール（Tied covariance）。
+class AnomalyClassifier(nn.Module):
+    """軽量二値分類器による異常検知モジュール。
 
-    fit() でクラスごとの embedding 平均と Pooled within-class 精度行列を設定し、
-    forward() で各 embedding の「最近クラスへのマハラノビス距離」を返す。
+    GWAP 出力（backbone の生特徴、1024次元）を入力として、正例（既知顔）/
+    負例（未知顔・ドメイン外）を分類する。
 
     設計:
-        - class_means: (num_classes, D) — クラスごとの embedding 平均
-        - precision:   (D, D)          — 全クラス共通の Pooled within-class 精度行列
-        - threshold:   scalar          — 異常検知閾値（Youden's J で設定）
+        - 入力: GWAP 出力 (B, gwap_dim) — backbone の生特徴（ArcFace head 変換前）
+        - 構造: Linear(gwap_dim, hidden) → BN(hidden) → ReLU → Dropout → Linear(hidden, 1)
+        - 出力: logit scalar (B,)  sigmoid 後に 0=正常, 1=異常
+        - threshold: nn.Buffer として保持（Youden's J で設定）
 
-    推論:
-        d(x) = min_c sqrt((x - μ_c)^T Σ_w^{-1} (x - μ_c))
-        スコアが大きいほど異常（全クラスから外れた入力）
+    GWAP 出力を使う理由:
+        embedding head の Linear+BN による変換は「クラス識別に有利な方向」へ
+        特徴を圧縮するため、画質・テクスチャ等の品質情報が失われやすい。
+        GWAP 出力はその変換前であり、低品質画像・ドメイン外顔の検出に
+        より豊富な情報が残っている。
 
     統計量と閾値は nn.Buffer として保持されるため、state_dict に含まれ、
     .pt ファイルへの保存・復元、および ONNX エクスポートに対応する。
-
-    NOTE: 精度を重視して生の（正規化前の）embedding を入力として使用する。
-          ArcFace の embedding head 出力（emb_size 次元）をそのまま渡す。
     """
 
-    def __init__(self, emb_size: int, num_classes: int = 1):
+    def __init__(
+        self,
+        gwap_dim: int,
+        hidden_dim: int = ANOMALY_HIDDEN_DIM,
+        dropout: float = ANOMALY_DROPOUT,
+    ):
         super().__init__()
-        self.emb_size = emb_size
-        self.num_classes = num_classes
+        self.fc1 = nn.Linear(gwap_dim, hidden_dim)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.drop = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim, 1)
+
         # バッファ: 勾配不要、state_dict に含まれる
-        # class_means: (num_classes, D) — クラスごとの平均ベクトル
-        self.register_buffer("class_means", torch.zeros(num_classes, emb_size))
-        self.register_buffer("precision", torch.eye(emb_size))
         self.register_buffer("threshold", torch.tensor(float("inf")))
+
+    def logit(self, x: torch.Tensor) -> torch.Tensor:
+        """sigmoid 前の raw logit を返す（BCEWithLogitsLoss 用）。
+
+        Args:
+            x: (B, gwap_dim) — GWAP 出力（backbone 生特徴）
+        Returns:
+            logit: (B,) — raw logit（sigmoid 適用前）
+        """
+        h = torch.relu(self.bn1(self.fc1(x)))
+        h = self.drop(h)
+        return self.fc2(h).squeeze(1)  # (B,)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (B, emb_size) — 生の embedding（正規化前）
+            x: (B, gwap_dim) — GWAP 出力（backbone 生特徴）
         Returns:
-            dist: (B,) — 最近クラスへのマハラノビス距離（大きいほど異常）
+            score: (B,) — 異常スコア（大きいほど異常）。sigmoid(logit) 値。
         """
-        # diff: (B, 1, D) - (1, C, D) = (B, C, D)
-        diff = x.unsqueeze(1) - self.class_means.unsqueeze(0)
-        # (B, C, D) @ (D, D) = (B, C, D)
-        left = diff @ self.precision
-        dist_sq = (left * diff).sum(dim=2)  # (B, C)
-        # 各サンプルについて全クラスの中で最小二乗距離を取る
-        min_dist_sq = dist_sq.clamp(min=0.0).min(dim=1).values  # (B,)
-        dist = min_dist_sq.sqrt()  # (B,)
-        # NaN ガード: 数値的不安定時に 0.0 で置換（距離が算出不能 → 正常扱い）
-        # posinf は inf のまま保持して downstream で異常判定させる
-        return torch.nan_to_num(dist, nan=0.0, neginf=0.0)
+        return torch.sigmoid(self.logit(x))
 
     def is_fitted(self) -> bool:
         """閾値が有限値であれば fit 済みとみなす。"""
@@ -239,29 +251,29 @@ class MahalanobisLayer(nn.Module):
 
 # ──────────────────────────────────────────────
 # Face Recognition Model
-# backbone (timm ConvNeXt V2 Large) + GWAP + Head + ArcFace + MahalanobisLayer
+# backbone (timm FastViT-S12) + GWAP + Head + ArcFace + AnomalyClassifier
 # ──────────────────────────────────────────────
 class FaceRecognitionModel(nn.Module):
     """
-    backbone (timm ConvNeXt V2 Large features) + GWAP + embedding head
-    + ArcFace Head + MahalanobisLayer を一体化したモデル。
+    backbone (timm FastViT-S12 features) + GWAP + embedding head
+    + ArcFace Head + AnomalyClassifier を一体化したモデル。
 
     構造:
-        backbone.forward_features(x) → (B, 1536, H, W)
-        GWAP                         → (B, 1536)
-        Linear(1536, 1024)           → BN(1024) → SiLU → Dropout
+        backbone.forward_features(x) → (B, 1024, H, W)
+        GWAP                         → (B, 1024)   ← gwap_out (anomaly 入力)
+        Linear(1024, 1024)           → BN(1024) → SiLU → Dropout
         Linear(1024, 512)            → embedding (B, 512)  ← 生の embedding
 
     公開メソッド:
         embed(x)                → 生の embedding (backbone + GWAP + head)
+        embed_gwap(x)           → GWAP 出力 (backbone + GWAP のみ、anomaly 用)
         arcface_logits(e, l)    → ArcFace margin 付き logits (loss 計算用)
         cos_logits(e)           → margin なしの cosine logits (推論・val 用)
-        mahalanobis_score(e)    → min-class マハラノビス距離 (異常スコア)
+        anomaly_score(g)        → 異常スコア sigmoid(classifier(gwap_out))
 
     forward の挙動:
         train モード : arcface_logits を返す（margin 付き、labels 必須）
         eval  モード : (cos_logits, anomaly_score) タプルを返す
-                       anomaly_score = min_c dist(embed, μ_c)（生の embedding を使用）
 
     NOTE: train loss と val loss は margin の有無により非対称になる。
           これは ArcFace の仕様上意図的な挙動であり、両者の絶対値を直接比較
@@ -315,16 +327,25 @@ class FaceRecognitionModel(nn.Module):
         self._th = math.cos(math.pi - arc_m)  # cos(π - m)
         self._mm = math.sin(math.pi - arc_m) * arc_m
 
-        # ── Mahalanobis 異常検知 ──────────────────
-        self.mahal = MahalanobisLayer(emb_size, num_classes)
+        # ── Anomaly Classifier ────────────────────
+        # GWAP 出力 (backbone_dim 次元) を入力とする軽量二値分類器
+        self.anomaly = AnomalyClassifier(backbone_dim)
+
+    # ------------------------------------------------------------------
+    # embed_gwap: backbone + GWAP のみ（anomaly 分類器の入力用）
+    # ------------------------------------------------------------------
+    def embed_gwap(self, x: torch.Tensor) -> torch.Tensor:
+        """画像テンソル → GWAP 出力（backbone 生特徴、anomaly 分類器入力）"""
+        feat = self.backbone.forward_features(x)  # (B, backbone_dim, H, W)
+        return self.gwap(feat).float()  # (B, backbone_dim)
 
     # ------------------------------------------------------------------
     # embedding: backbone + GWAP + head (生の embedding、正規化前)
     # ------------------------------------------------------------------
     def embed(self, x: torch.Tensor) -> torch.Tensor:
         """画像テンソル → 生の embedding（正規化前）"""
-        feat = self.backbone.forward_features(x)  # (B, 1536, H, W)
-        pooled = self.gwap(feat)  # (B, 1536)
+        feat = self.backbone.forward_features(x)  # (B, 1024, H, W)
+        pooled = self.gwap(feat)  # (B, 1024)
         # head (BatchNorm1d を含む) は fp32 で実行する。
         # autocast (bf16/fp16) のまま BatchNorm1d に通すと
         # running_var が汚染されて NaN を生むリスクがある。
@@ -367,12 +388,12 @@ class FaceRecognitionModel(nn.Module):
         return F.linear(emb, w) * self.arc_s
 
     # ------------------------------------------------------------------
-    # マハラノビス距離（異常スコア）
-    # NOTE: 生の embedding（正規化前）を入力として使用する
+    # anomaly_score: 異常スコア（GWAP 出力を入力とする二値分類器）
+    # NOTE: GWAP 出力（backbone 生特徴）を入力として使用する
     # ------------------------------------------------------------------
-    def mahalanobis_score(self, embeddings: torch.Tensor) -> torch.Tensor:
-        """生の embedding → マハラノビス距離（大きいほど異常）"""
-        return self.mahal(embeddings)
+    def anomaly_score(self, gwap_out: torch.Tensor) -> torch.Tensor:
+        """GWAP 出力 → 異常スコア（大きいほど異常、0〜1）"""
+        return self.anomaly(gwap_out)
 
     # ------------------------------------------------------------------
     # forward: train → arcface logits, eval → (cos_logits, anomaly_score)
@@ -380,219 +401,190 @@ class FaceRecognitionModel(nn.Module):
     def forward(
         self, x: torch.Tensor, labels: torch.Tensor | None = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        emb = self.embed(x)
         if self.training:
+            emb = self.embed(x)
             if labels is None:
                 raise ValueError("train モードでは labels が必須です")
             return self.arcface_logits(emb, labels)
         else:
-            # eval モード: (cos_logits, anomaly_score) タプルを返す
+            # eval モード: GWAP 出力と embedding を両方計算
+            feat = self.backbone.forward_features(x)
+            gwap_out = self.gwap(feat).float()  # (B, backbone_dim)
+            emb = self.head(gwap_out)  # (B, emb_size)
             logits = self.cos_logits(emb)
-            anomaly = self.mahal(emb)  # 生の embedding でマハラノビス距離を計算
-            return logits, anomaly
+            score = self.anomaly(gwap_out)  # (B,)
+            return logits, score
 
 
 # ──────────────────────────────────────────────
-# Mahalanobis Fitting
+# Anomaly Classifier Fitting
 # ──────────────────────────────────────────────
-def fit_mahalanobis(
+def fit_anomaly_classifier(
     model: FaceRecognitionModel,
     pos_loader: DataLoader,
-    neg_loader: DataLoader,
+    neg_loaders: list[DataLoader],
     device: torch.device,
-    reg_lambda: float = MAHAL_REG_LAMBDA,
+    epochs: int = ANOMALY_EPOCHS,
+    lr: float = ANOMALY_LR,
 ) -> dict:
-    """ArcFace 学習後に Multi-class Mahalanobis 異常検知の統計量を計算してモデルに書き込む。
+    """ArcFace 学習後に軽量二値分類器（AnomalyClassifier）を学習しモデルに書き込む。
 
-    設計: クラスごとの平均ベクトル + Pooled within-class 精度行列（Tied covariance）
-        - d(x) = min_c sqrt((x - μ_c)^T Σ_w^{-1} (x - μ_c))
-        - ArcFace の特徴空間はクラスが球面上に分散するため、全体平均を使う
-          Global Mahalanobis は機能しない。各クラスの重心との距離を使うことで、
-          正例（学習済みクラスの顔）は小さく、負例（未知顔・非顔）は大きくなる。
+    設計:
+        - 入力特徴量: GWAP 出力（backbone 生特徴、1024次元）
+          embedding head 変換前であり、画質・テクスチャ情報が保存されている。
+        - 正例: face-dataset 全体（ラベル=0）
+        - 負例: face-errors + celebrity-1000 サンプル（ラベル=1）
+        - 損失: BCEWithLogitsLoss(pos_weight = N_neg / N_pos) でクラス不均衡補正
+        - ArcFace backbone/head は凍結し、anomaly.fc1, anomaly.bn1, anomaly.fc2 のみ学習
 
     手順:
-        1. 正例 (face-dataset 全体) の生 embedding とラベルを収集
-        2. クラスごとの平均 μ_c を計算
-        3. Pooled within-class 共分散行列 Σ_w を計算し、精度行列 Σ_w^{-1} を求める
-        4. モデルの class_means / precision バッファを更新
-        5. MahalanobisLayer 経由で正例・負例それぞれの min-distance を計算
-        6. Youden's J 統計量で最適閾値を決定し、threshold バッファを更新
+        1. 正例・負例の GWAP 特徴量を収集（backbone は frozen, no_grad）
+        2. BCEWithLogitsLoss + Adam で AnomalyClassifier を学習
+        3. 学習後のスコアで AUC を計算
+        4. Youden's J 統計量で最適閾値を決定し threshold バッファを更新
 
     Args:
-        model:      FaceRecognitionModel（eval モードに切り替えて使用）
-        pos_loader: 正例 DataLoader（ラベル付き、labeled=True）
-        neg_loader: 負例 DataLoader（ラベルなし、labeled=False）
-        device:     計算デバイス
-        reg_lambda: 共分散行列の対角正則化係数（相対スケーリングのベースライン）
+        model:       FaceRecognitionModel（eval モードに切り替えて使用）
+        pos_loader:  正例 DataLoader（ラベル付き、labeled=True）
+        neg_loaders: 負例 DataLoader のリスト（各 DataLoader は labeled=False）
+        device:      計算デバイス
+        epochs:      AnomalyClassifier 学習エポック数
+        lr:          AnomalyClassifier 学習率
 
     Returns:
-        dict with keys: auc, threshold, pos_mean_dist, neg_mean_dist
+        dict with keys: auc, threshold, pos_mean_score, neg_mean_score
     """
     model.eval()
 
-    num_classes = model.mahal.num_classes
-    emb_size = model.mahal.emb_size
-
-    # ── Step 1: 正例 embedding とラベルを収集 ──────────────────────────
-    print("  [Mahalanobis] Collecting positive embeddings with labels...")
-    pos_embeddings = []
-    pos_labels_list = []
+    # ── Step 1: 正例の GWAP 特徴量を収集 ──────────────────────────────
+    print("  [AnomalyClassifier] Collecting positive GWAP features...")
+    pos_feats = []
     with torch.no_grad():
-        for batch in tqdm(pos_loader, desc="  pos embed", leave=False):
-            imgs, lbls = batch[0].to(device, non_blocking=True), batch[1]
-            with torch.autocast(
-                device_type=device.type, enabled=USE_AMP, dtype=_AMP_TORCH_DTYPE
-            ):
-                emb = model.embed(imgs)
-            pos_embeddings.append(emb.float().cpu())
-            pos_labels_list.append(lbls)
-    pos_emb = torch.cat(pos_embeddings, dim=0)  # (N_pos, D)
-    pos_labels = torch.cat(pos_labels_list, dim=0)  # (N_pos,)
-    print(
-        f"  [Mahalanobis] Positive embeddings: {pos_emb.shape}, classes: {num_classes}"
-    )
-
-    # ── Step 2: クラスごとの平均を計算 ──────────────────────────────────
-    # NOTE: float64 で計算することで大規模な累積丸め誤差を抑制する。
-    print("  [Mahalanobis] Computing per-class means (float64)...")
-    pos_emb64 = pos_emb.double()  # float32 → float64
-    class_means64 = torch.zeros(num_classes, emb_size, dtype=torch.float64)
-    class_counts = torch.zeros(num_classes, dtype=torch.long)
-
-    for c in range(num_classes):
-        mask = pos_labels == c
-        if mask.sum() > 0:
-            class_means64[c] = pos_emb64[mask].mean(dim=0)
-            class_counts[c] = mask.sum()
-
-    n_empty = int((class_counts == 0).sum())
-    if n_empty > 0:
-        print(
-            f"  [Mahalanobis] WARNING: {n_empty} classes have no samples; "
-            f"their means remain zero."
-        )
-
-    # ── Step 3: Pooled within-class 共分散行列を計算 ────────────────────
-    # S_w = Σ_c Σ_{x in c} (x - μ_c)(x - μ_c)^T / (N - C)
-    # クラスごとに中心化して累積することで、クラス間の分散（クラスセントロイド間の分散）
-    # を除去する。これにより ArcFace 特徴空間でも正常なクラス内分散が得られる。
-    print("  [Mahalanobis] Computing pooled within-class covariance (float64)...")
-    n_total = pos_emb64.shape[0]
-    n_nonempty_classes = int((class_counts > 0).sum())
-    dof = max(n_total - n_nonempty_classes, 1)  # 自由度 (N - C)
-
-    # 各サンプルをそのクラス平均で中心化する
-    class_mean_per_sample = class_means64[pos_labels.long()]  # (N_pos, D)
-    centered = pos_emb64 - class_mean_per_sample  # (N_pos, D)
-    cov_w = (centered.T @ centered) / dof  # (D, D) float64
-
-    # 正則化: λ = trace(Σ_w)/D × 1e-3 (「平均クラス内分散の 0.1%」を下限保証)
-    trace_mean = cov_w.diagonal().mean().item()
-    adaptive_lambda = max(trace_mean * 1e-3, reg_lambda)
-    print(
-        f"  [Mahalanobis] within-class trace/D={trace_mean:.4g}, "
-        f"adaptive λ={adaptive_lambda:.4g}"
-    )
-    cov_w += adaptive_lambda * torch.eye(emb_size, dtype=torch.float64)
-
-    # 精度行列 Σ_w^{-1}: float64 で計算し float32 に変換して保存
-    precision64 = torch.linalg.inv(cov_w)
-    if not torch.isfinite(precision64).all():
-        print(
-            "  [Mahalanobis] linalg.inv returned non-finite values, falling back to pinv"
-        )
-        precision64 = torch.linalg.pinv(cov_w)
-    precision = precision64.float()  # float32 に戻してバッファへ書き込む
-
-    # ── Step 4: バッファを更新して MahalanobisLayer を使えるようにする ──
-    # class_means バッファのサイズが変化しないよう、同じ num_classes で初期化済み。
-    model.mahal.class_means.copy_(class_means64.float().to(device))
-    model.mahal.precision.copy_(precision.to(device))
-    print(
-        "  [Mahalanobis] Buffers pre-loaded; computing distances via MahalanobisLayer..."
-    )
-
-    # 正例距離（min-distance to nearest class）
-    pos_dists = []
-    with torch.no_grad():
-        for batch in tqdm(pos_loader, desc="  pos dist", leave=False):
+        for batch in tqdm(pos_loader, desc="  pos gwap", leave=False):
             imgs = batch[0].to(device, non_blocking=True)
             with torch.autocast(
                 device_type=device.type, enabled=USE_AMP, dtype=_AMP_TORCH_DTYPE
             ):
-                emb = model.embed(imgs).float()
-            pos_dists.append(model.mahal(emb).cpu())
-    pos_dists = torch.cat(pos_dists, dim=0).numpy()  # (N_pos,)
+                gwap = model.embed_gwap(imgs)
+            pos_feats.append(gwap.float().cpu())
+    pos_feats_t = torch.cat(pos_feats, dim=0)  # (N_pos, backbone_dim)
+    print(f"  [AnomalyClassifier] Positive features: {pos_feats_t.shape}")
 
-    # ── Step 5: 負例のマハラノビス距離を計算 ────────────────────────────
-    # neg_loader は labeled=False の HuggingFaceFaceDataset を使用しているため、
-    # batch は常に (imgs, -1) のタプルを返す。
-    print("  [Mahalanobis] Collecting negative embeddings and computing distances...")
-    neg_dists = []
+    # ── Step 2: 負例の GWAP 特徴量を収集 ──────────────────────────────
+    print("  [AnomalyClassifier] Collecting negative GWAP features...")
+    neg_feats = []
+    for neg_loader in neg_loaders:
+        with torch.no_grad():
+            for batch in tqdm(neg_loader, desc="  neg gwap", leave=False):
+                imgs = batch[0].to(device, non_blocking=True)
+                with torch.autocast(
+                    device_type=device.type, enabled=USE_AMP, dtype=_AMP_TORCH_DTYPE
+                ):
+                    gwap = model.embed_gwap(imgs)
+                neg_feats.append(gwap.float().cpu())
+    neg_feats_t = torch.cat(neg_feats, dim=0)  # (N_neg, backbone_dim)
+    print(f"  [AnomalyClassifier] Negative features: {neg_feats_t.shape}")
+
+    n_pos = pos_feats_t.shape[0]
+    n_neg = neg_feats_t.shape[0]
+
+    # ── Step 3: AnomalyClassifier を学習 ──────────────────────────────
+    # backbone/head/arc_weight は凍結し anomaly のみ学習する
+    print(f"  [AnomalyClassifier] Training classifier ({epochs} epochs)...")
+    model.anomaly.train()
+
+    optimizer = torch.optim.Adam(model.anomaly.parameters(), lr=lr)
+    # pos_weight = N_neg / N_pos: 正例（ラベル=0）が多いためクラス不均衡を補正
+    # BCEWithLogitsLoss の target: 正例=0, 負例=1
+    pos_weight = torch.tensor(n_neg / max(n_pos, 1), dtype=torch.float32, device=device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    # 全データをシャッフルして DataLoader を作る
+    all_feats = torch.cat([pos_feats_t, neg_feats_t], dim=0)
+    all_targets = torch.cat(
+        [
+            torch.zeros(n_pos, dtype=torch.float32),
+            torch.ones(n_neg, dtype=torch.float32),
+        ],
+        dim=0,
+    )
+
+    from torch.utils.data import TensorDataset
+
+    clf_dataset = TensorDataset(all_feats, all_targets)
+    clf_loader = DataLoader(
+        clf_dataset,
+        batch_size=BATCH_SIZE * 2,
+        shuffle=True,
+        num_workers=0,  # テンソルデータなので worker 不要
+    )
+
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        n_steps = 0
+        for feat_batch, tgt_batch in clf_loader:
+            feat_batch = feat_batch.to(device)
+            tgt_batch = tgt_batch.to(device)
+
+            # sigmoid 前の logit を直接計算（BCEWithLogitsLoss に渡す）
+            logit = model.anomaly.logit(feat_batch)
+
+            loss = criterion(logit, tgt_batch)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            n_steps += 1
+
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(
+                f"  [AnomalyClassifier] epoch {epoch + 1}/{epochs}  loss={epoch_loss / max(n_steps, 1):.4f}"
+            )
+
+    model.anomaly.eval()
+
+    # ── Step 4: AUC 計算と Youden's J で最適閾値を決定 ──────────────────
+    print("  [AnomalyClassifier] Computing AUC and optimal threshold (Youden's J)...")
+    model.eval()
     with torch.no_grad():
-        for batch in tqdm(neg_loader, desc="  neg dist", leave=False):
-            imgs = batch[0].to(device, non_blocking=True)
-            with torch.autocast(
-                device_type=device.type, enabled=USE_AMP, dtype=_AMP_TORCH_DTYPE
-            ):
-                emb = model.embed(imgs).float()
-            neg_dists.append(model.mahal(emb).cpu())
-    neg_dists = torch.cat(neg_dists, dim=0).numpy()  # (N_neg,)
-    print(f"  [Mahalanobis] Negative distances computed: {len(neg_dists)} samples")
+        pos_scores = model.anomaly(pos_feats_t.to(device)).cpu().numpy()
+        neg_scores = model.anomaly(neg_feats_t.to(device)).cpu().numpy()
 
-    # ── Step 6: AUC 計算と Youden's J で最適閾値を決定 ──────────────────
-    print("  [Mahalanobis] Computing AUC and optimal threshold (Youden's J)...")
-    # ラベル: 正例=0 (normal), 負例=1 (anomaly)
-    all_dists = np.concatenate([pos_dists, neg_dists])
+    all_scores = np.concatenate([pos_scores, neg_scores])
     all_labels = np.concatenate(
         [
-            np.zeros(len(pos_dists), dtype=np.int32),
-            np.ones(len(neg_dists), dtype=np.int32),
+            np.zeros(len(pos_scores), dtype=np.int32),
+            np.ones(len(neg_scores), dtype=np.int32),
         ]
     )
 
-    # NaN/Inf チェック: 残存する場合はサンプルを除外して警告を出す
-    nan_mask = ~np.isfinite(all_dists)
-    if nan_mask.any():
-        n_nan = int(nan_mask.sum())
-        print(
-            f"  [Mahalanobis] WARNING: {n_nan}/{len(all_dists)} distances are NaN/Inf — excluding from AUC computation"
-        )
-        valid = ~nan_mask
-        all_dists = all_dists[valid]
-        all_labels = all_labels[valid]
-        pos_dists = pos_dists[np.isfinite(pos_dists)]
-        neg_dists = neg_dists[np.isfinite(neg_dists)]
-
-    auc = roc_auc_score(all_labels, all_dists)
-
-    # Youden's J: J = Sensitivity + Specificity - 1 を最大化する閾値
     from sklearn.metrics import roc_curve
 
-    fpr, tpr, roc_thresholds = roc_curve(all_labels, all_dists)
-    j_scores = tpr - fpr  # Youden's J = TPR - FPR
+    auc = roc_auc_score(all_labels, all_scores)
+    fpr, tpr, roc_thresholds = roc_curve(all_labels, all_scores)
+    j_scores = tpr - fpr
     best_idx = int(np.argmax(j_scores))
     optimal_threshold = float(roc_thresholds[best_idx])
 
-    pos_mean_dist = float(pos_dists.mean())
-    neg_mean_dist = float(neg_dists.mean())
-    print(f"  [Mahalanobis] AUC={auc:.4f}, threshold={optimal_threshold:.4f}")
+    pos_mean_score = float(pos_scores.mean())
+    neg_mean_score = float(neg_scores.mean())
+    print(f"  [AnomalyClassifier] AUC={auc:.4f}, threshold={optimal_threshold:.4f}")
     print(
-        f"  [Mahalanobis] pos_mean_dist={pos_mean_dist:.4f}, neg_mean_dist={neg_mean_dist:.4f}"
+        f"  [AnomalyClassifier] pos_mean_score={pos_mean_score:.4f}, "
+        f"neg_mean_score={neg_mean_score:.4f}"
     )
 
-    # ── Step 7: バッファに閾値を書き込んでフィット完了 ──────────────────
-    # class_means / precision は Step 4 で書き込み済み。閾値のみ更新する。
-    model.mahal.threshold.copy_(
+    # ── Step 5: threshold バッファに書き込んでフィット完了 ────────────
+    model.anomaly.threshold.copy_(
         torch.tensor(optimal_threshold, dtype=torch.float32, device=device)
     )
-    print("  [Mahalanobis] Model buffers updated.")
+    print("  [AnomalyClassifier] Model buffers updated.")
 
     return {
         "auc": auc,
         "threshold": optimal_threshold,
-        "pos_mean_dist": pos_mean_dist,
-        "neg_mean_dist": neg_mean_dist,
+        "pos_mean_score": pos_mean_score,
+        "neg_mean_score": neg_mean_score,
     }
 
 
@@ -612,6 +604,10 @@ def main():
 
     # 固定入力サイズ (224x224) に最適な cuDNN カーネルを自動選択
     torch.backends.cudnn.benchmark = True
+    # TF32: Ampere以降のGPUでfp32 matmulをTF32近似で高速化する
+    # bf16 autocast内の演算には影響しないが、arcface_logitsなどの
+    # fp32強制箇所でわずかに高速化される。精度への影響は実質なし。
+    torch.set_float32_matmul_precision("high")
 
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(OUTPUT_DIR, run_timestamp)
@@ -641,7 +637,9 @@ def main():
             "use_amp": USE_AMP,
             "pooling": "GWAP",
             "scheduler": "CosineAnnealingLR",
-            "mahal_reg_lambda": MAHAL_REG_LAMBDA,
+            "anomaly_hidden_dim": ANOMALY_HIDDEN_DIM,
+            "anomaly_epochs": ANOMALY_EPOCHS,
+            "celebrity_neg_samples": CELEBRITY_NEG_SAMPLES,
             "amp_dtype": AMP_DTYPE,
         },
     )
@@ -749,8 +747,11 @@ def main():
     # 一貫性のため compile 前の参照を使う。
     backbone_params = list(model_to_save.backbone.parameters())
     backbone_param_ids = {id(p) for p in backbone_params}
+    anomaly_param_ids = {id(p) for p in model_to_save.anomaly.parameters()}
     head_params = [
-        p for p in model_to_save.parameters() if id(p) not in backbone_param_ids
+        p
+        for p in model_to_save.parameters()
+        if id(p) not in backbone_param_ids and id(p) not in anomaly_param_ids
     ]
 
     optimizer = torch.optim.SGD(
@@ -941,16 +942,16 @@ def main():
     wandb.log({"confusion_matrix": wandb.Image(cm_path)})
 
     # ──────────────────────────────────────────────
-    # Mahalanobis 異常検知の学習
-    # best model の重みをロードしてから統計量を計算する
+    # AnomalyClassifier の学習
+    # best model の重みをロードしてから学習する
     # ──────────────────────────────────────────────
-    print("Fitting Mahalanobis anomaly detector (loading model_best.pt)...")
+    print("Fitting AnomalyClassifier (loading model_best.pt)...")
     best_ckpt_path = os.path.join(run_dir, "model_best.pt")
     model_to_save.load_state_dict(torch.load(best_ckpt_path, map_location=device))
     model_to_save.eval()
 
     # 正例 DataLoader: face-dataset 全体 (transform_eval)
-    pos_loader_mahal = DataLoader(
+    pos_loader_anomaly = DataLoader(
         eval_dataset,
         batch_size=BATCH_SIZE * 2,
         shuffle=False,
@@ -958,7 +959,7 @@ def main():
         pin_memory=True,
     )
 
-    # 負例 DataLoader: helloproject-face-errors
+    # 負例 DataLoader 1: helloproject-face-errors
     print("Loading helloproject-face-errors dataset...")
     error_raw = load_dataset("yayoimizuha/helloproject-face-errors")
     # split 名を動的に解決（通常は "train"）
@@ -967,7 +968,7 @@ def main():
     print(f"  face-errors split='{error_split_name}', num_images={len(error_hf)}")
 
     error_dataset = HuggingFaceFaceDataset(error_hf, transform_eval, labeled=False)
-    neg_loader_mahal = DataLoader(
+    neg_loader_errors = DataLoader(
         error_dataset,
         batch_size=BATCH_SIZE * 2,
         shuffle=False,
@@ -975,26 +976,53 @@ def main():
         pin_memory=True,
     )
 
-    mahal_stats = fit_mahalanobis(
+    # 負例 DataLoader 2: tonyassi/celebrity-1000 からサンプリング
+    print(f"Loading tonyassi/celebrity-1000 ({CELEBRITY_NEG_SAMPLES} samples)...")
+    celebrity_raw = load_dataset("tonyassi/celebrity-1000", split="train")
+    # ランダムサンプリング（シードを固定して再現性を確保）
+    rng_indices = (
+        np.random.default_rng(42)
+        .choice(
+            len(celebrity_raw),
+            size=min(CELEBRITY_NEG_SAMPLES, len(celebrity_raw)),
+            replace=False,
+        )
+        .tolist()
+    )
+    celebrity_subset = celebrity_raw.select(rng_indices)
+    print(f"  celebrity-1000 sampled: {len(celebrity_subset)} images")
+
+    celebrity_dataset = HuggingFaceFaceDataset(
+        celebrity_subset, transform_eval, labeled=False
+    )
+    neg_loader_celebrity = DataLoader(
+        celebrity_dataset,
+        batch_size=BATCH_SIZE * 2,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    anomaly_stats = fit_anomaly_classifier(
         model=model_to_save,
-        pos_loader=pos_loader_mahal,
-        neg_loader=neg_loader_mahal,
+        pos_loader=pos_loader_anomaly,
+        neg_loaders=[neg_loader_errors, neg_loader_celebrity],
         device=device,
     )
 
     wandb.log(
         {
-            "mahal/auc": mahal_stats["auc"],
-            "mahal/threshold": mahal_stats["threshold"],
-            "mahal/pos_mean_dist": mahal_stats["pos_mean_dist"],
-            "mahal/neg_mean_dist": mahal_stats["neg_mean_dist"],
+            "anomaly/auc": anomaly_stats["auc"],
+            "anomaly/threshold": anomaly_stats["threshold"],
+            "anomaly/pos_mean_score": anomaly_stats["pos_mean_score"],
+            "anomaly/neg_mean_score": anomaly_stats["neg_mean_score"],
         }
     )
 
-    # マハラノビス統計量込みのモデルを保存
-    mahal_model_path = os.path.join(run_dir, "model_best_with_mahal.pt")
-    torch.save(model_to_save.state_dict(), mahal_model_path)
-    print(f"Model with Mahalanobis detector saved to {mahal_model_path}")
+    # AnomalyClassifier 込みのモデルを保存
+    anomaly_model_path = os.path.join(run_dir, "model_best_with_anomaly.pt")
+    torch.save(model_to_save.state_dict(), anomaly_model_path)
+    print(f"Model with AnomalyClassifier saved to {anomaly_model_path}")
 
     wandb.finish()
 

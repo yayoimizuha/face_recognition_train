@@ -9,15 +9,15 @@ Block 量子化方式を採用し、DequantizeLinear を使わず標準 ONNX ノ
 
 ## 出力モデル一覧
 
-| モデル名    | ウェイト格納      | 計算 dtype | Mahalanobis | サフィックス      |
-|-------------|-------------------|-----------|-------------|-------------------|
-| FP32        | fp32              | fp32      | fp32        | `.onnx`           |
-| BF16        | bf16              | bf16      | fp32        | `_bf16.onnx`      |
-| FP16        | fp16              | fp16      | fp32        | `_fp16.onnx`      |
-| BF16+INT8   | int8 per-block    | bf16      | fp32        | `_bf16int8.onnx`  |
-| BF16+FP8    | fp8e4m3 per-block | bf16      | fp32        | `_bf16fp8.onnx`   |
-| FP16+INT8   | int8 per-block    | fp16      | fp32        | `_fp16int8.onnx`  |
-| FP16+FP8    | fp8e4m3 per-block | fp16      | fp32        | `_fp16fp8.onnx`   |
+| モデル名    | ウェイト格納      | 計算 dtype | AnomalyClassifier | サフィックス      |
+|-------------|-------------------|-----------|-------------------|-------------------|
+| FP32        | fp32              | fp32      | fp32              | `.onnx`           |
+| BF16        | bf16              | bf16      | fp32              | `_bf16.onnx`      |
+| FP16        | fp16              | fp16      | fp32              | `_fp16.onnx`      |
+| BF16+INT8   | int8 per-block    | bf16      | fp32              | `_bf16int8.onnx`  |
+| BF16+FP8    | fp8e4m3 per-block | bf16      | fp32              | `_bf16fp8.onnx`   |
+| FP16+INT8   | int8 per-block    | fp16      | fp32              | `_fp16int8.onnx`  |
+| FP16+FP8    | fp8e4m3 per-block | fp16      | fp32              | `_fp16fp8.onnx`   |
 
 ## ファイル構成
 
@@ -30,7 +30,7 @@ hp_finetune/
 ├── onnx_graph_utils.py     # ONNX グラフ操作ユーティリティ
 │                           #   - バッチ次元動的化
 │                           #   - Reshape 修正
-│                           #   - マハラノビスノード特定
+│                           #   - AnomalyClassifier ノード特定
 │                           #   - メタデータ埋め込み
 │                           #   - Shape inference (TensorRT 用)
 ├── config_loader.py        # チェックポイント横の finetune_facenet.py から定数を読み取る
@@ -166,7 +166,8 @@ weight_conversion.py
   └── (numpy, torch, onnx のみ — 外部モジュール依存なし)
 
 onnx_graph_utils.py
-  └── (numpy, onnx, onnxruntime のみ)
+  ├── (numpy, onnx, onnxruntime)
+  └── weight_conversion.py  (convert_initializers / TargetDtype — bf16 変換時)
 
 verification.py
   └── data_utils.py
@@ -190,12 +191,12 @@ Per-channel (出力チャネルごとに 1 つの scale) は Conv には適す�
 には適用しにくい。Per-block (固定ブロック単位) は粒度と精度のバランスが良く、
 Block-FP8 の業界標準に近い。
 
-### マハラノビスノードを fp32 で維持する理由
+### AnomalyClassifier ノードを fp32 で維持する理由
 
-精度行列 (precision matrix) は 512×512 の行列で、要素値が最大 ~62000 に達する。
-BF16 の仮数部 7 bit では ~0.8% の相対誤差が各要素に入り、512 次元の行列積で
-累積すると異常スコアが大幅に狂う。FP16 は max ~65504 でクリッピングが起きる。
-fp32 維持のサイズコストは ~513 KiB (~2.4%) と軽微。
+`AnomalyClassifier` は `fc1`（Linear 1024→256）、`BN`（BatchNorm1d）、`fc2`（Linear 256→1）で構成される。
+最終的な sigmoid 出力は 0〜1 の確率値であり、閾値判定に用いる。
+fp32 維持のサイズコストは軽微だが、BF16/FP16 では BN の `running_mean` / `running_var` に
+量子化誤差が入り、小さなスコア差での閾値判定が不安定になる恐れがあるため fp32 を維持する。
 
 ### 感度検出を 2 段階にする理由
 

@@ -9,10 +9,12 @@ rather than imported from a global config, so this module is backbone-agnostic.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
 from onnxruntime.quantization import CalibrationDataReader
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -58,6 +60,70 @@ def load_train_dataset():
     from datasets import load_dataset
 
     return load_dataset(DATASET_NAME)["train"]
+
+
+# ──────────────────────────────────────────────
+# DataLoader-based inference dataset
+# ──────────────────────────────────────────────
+_DEFAULT_NUM_WORKERS = min(os.cpu_count() or 4, 8)
+
+
+class HFInferenceDataset(Dataset):
+    """Wraps a HuggingFace dataset split for use with torch DataLoader.
+
+    Each item is a ``(tensor, pil_image, label)`` tuple where:
+    - ``tensor``: float32 CHW tensor after the inference transform
+    - ``pil_image``: original PIL image (RGB) before any transform
+    - ``label``: integer class index, or ``-1`` if no "label" column
+    """
+
+    def __init__(self, hf_dataset, transform: transforms.Compose) -> None:
+        self._dataset = hf_dataset
+        self._transform = transform
+        self._has_label = "label" in hf_dataset.features
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def __getitem__(self, idx: int):
+        item = self._dataset[idx]
+        img = item["image"].convert("RGB")
+        tensor = self._transform(img)
+        label = int(item["label"]) if self._has_label else -1
+        return tensor, img, label
+
+
+def make_inference_loader(
+    hf_dataset,
+    cfg: "ImageConfig",
+    batch_size: int,
+    *,
+    num_workers: int = _DEFAULT_NUM_WORKERS,
+) -> DataLoader:
+    """Return a DataLoader that parallelises image pre-processing.
+
+    ``pin_memory=True`` enables faster host→device transfers when a GPU
+    provider is in use.  The collate function keeps PIL images as a plain
+    Python list (DataLoader cannot stack arbitrary objects).
+    """
+    transform = get_inference_transform(cfg)
+    ds = HFInferenceDataset(hf_dataset, transform)
+
+    def _collate(batch):
+        tensors, pil_images, labels = zip(*batch)
+        import torch
+
+        return torch.stack(tensors), list(pil_images), list(labels)
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=_collate,
+        persistent_workers=(num_workers > 0),
+    )
 
 
 def get_class_names_from_dataset() -> list[str]:

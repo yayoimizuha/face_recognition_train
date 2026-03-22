@@ -6,8 +6,8 @@ Uses only standard ONNX nodes (Cast, Mul, Reshape, Slice) for weight
 restoration — no DequantizeLinear — ensuring full TensorRT compatibility.
 
 Two checkpoint types are supported:
-  - model_best.pt                  (classification only)
-  - model_best_with_mahal.pt       (classification + Mahalanobis anomaly detection)
+  - model_best.pt                    (classification only)
+  - model_best_with_anomaly.pt       (classification + AnomalyClassifier)
 
 Output variants:
     <stem>.onnx              -- fp32  weights, fp32  activations
@@ -18,7 +18,7 @@ Output variants:
     <stem>_fp16int8.onnx     -- per-block INT8 weights (fp16 scale) + fp16 activations
     <stem>_fp16fp8.onnx      -- per-block FP8  weights (fp16 scale) + fp16 activations
 
-Mahalanobis nodes are always kept in fp32 for numerical stability.
+AnomalyClassifier nodes are always kept in fp32 for numerical stability.
 Batch size is dynamic (any batch size works at inference time).
 Class label names are embedded in ONNX metadata_props.
 
@@ -29,10 +29,10 @@ are automatically detected via a 2-stage hybrid approach:
 
 Usage:
     python hp_finetune/export_onnx.py \\
-        --checkpoint hp_finetune/work_dirs/<run>/model_best_with_mahal.pt
+        --checkpoint hp_finetune/work_dirs/<run>/model_best_with_anomaly.pt
 
     python hp_finetune/export_onnx.py \\
-        --checkpoint hp_finetune/work_dirs/<run>/model_best_with_mahal.pt \\
+        --checkpoint hp_finetune/work_dirs/<run>/model_best_with_anomaly.pt \\
         --block-size 64 --nrmse-threshold 0.01
 """
 
@@ -70,9 +70,10 @@ from hp_finetune.onnx_graph_utils import (
     convert_graph_to_fp16,
     embed_class_metadata,
     fix_hardcoded_batch_in_reshapes,
-    get_mahal_initializer_names,
+    get_anomaly_initializer_names,
     infer_shapes_for_tensorrt,
     make_batch_dim_dynamic,
+    make_intermediate_batch_dims_dynamic,
     merge_external_data,
 )
 from hp_finetune.verification import (
@@ -139,25 +140,62 @@ class ClassificationModel(_ClassificationBase):
 
 
 class ClassificationWithAnomalyModel(_ClassificationBase):
-    """backbone + GWAP + head + arc_weight + Mahalanobis → (logits, anomaly_score).
+    """backbone + GWAP + head + arc_weight + AnomalyClassifier → (logits, anomaly_score).
 
-    anomaly_score = min_c sqrt((raw_emb - μ_c)^T Σ_w^{-1} (raw_emb - μ_c))
+    anomaly_score = sigmoid(AnomalyClassifier(gwap_out))
+    入力特徴量は GWAP 出力（backbone 生特徴、embedding head 変換前）。
     """
 
     def __init__(self, full_model: FaceRecognitionModel):
         super().__init__(full_model)
-        # class_means: (num_classes, D) — クラスごとの embedding 平均
-        self.register_buffer("mahal_class_means", full_model.mahal.class_means.clone())
-        self.register_buffer("mahal_precision", full_model.mahal.precision.clone())
-        self.register_buffer("mahal_threshold", full_model.mahal.threshold.clone())
+        # AnomalyClassifier の重みをコピー
+        self.anomaly_fc1_weight = nn.Parameter(
+            full_model.anomaly.fc1.weight.data.clone(), requires_grad=False
+        )
+        self.anomaly_fc1_bias = nn.Parameter(
+            full_model.anomaly.fc1.bias.data.clone(), requires_grad=False
+        )
+        self.anomaly_bn1_weight = nn.Parameter(
+            full_model.anomaly.bn1.weight.data.clone(), requires_grad=False
+        )
+        self.anomaly_bn1_bias = nn.Parameter(
+            full_model.anomaly.bn1.bias.data.clone(), requires_grad=False
+        )
+        self.register_buffer(
+            "anomaly_bn1_running_mean", full_model.anomaly.bn1.running_mean.clone()
+        )
+        self.register_buffer(
+            "anomaly_bn1_running_var", full_model.anomaly.bn1.running_var.clone()
+        )
+        self.anomaly_fc2_weight = nn.Parameter(
+            full_model.anomaly.fc2.weight.data.clone(), requires_grad=False
+        )
+        self.anomaly_fc2_bias = nn.Parameter(
+            full_model.anomaly.fc2.bias.data.clone(), requires_grad=False
+        )
+        self.register_buffer("anomaly_threshold", full_model.anomaly.threshold.clone())
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        raw_emb, logits = self._embed_and_classify(x)
-        # diff: (B, 1, D) - (1, C, D) = (B, C, D)
-        diff = raw_emb.unsqueeze(1) - self.mahal_class_means.unsqueeze(0)
-        left = diff @ self.mahal_precision  # (B, C, D)
-        dist_sq = (left * diff).sum(dim=2).clamp(min=0.0)  # (B, C)
-        anomaly_score = dist_sq.min(dim=1).values.sqrt()  # (B,)
+        feat = self.backbone.forward_features(x)
+        gwap_out = self.gwap(feat)  # (B, backbone_dim)
+        raw_emb = self.head(gwap_out)  # (B, emb_size)
+        emb_norm = F.normalize(raw_emb, dim=1)
+        logits = F.linear(emb_norm, self.arc_weight_normalized) * self.arc_s
+
+        # AnomalyClassifier の forward を展開（BN を eval モードで実行）
+        h = F.linear(gwap_out, self.anomaly_fc1_weight, self.anomaly_fc1_bias)
+        h = F.batch_norm(
+            h,
+            self.anomaly_bn1_running_mean,
+            self.anomaly_bn1_running_var,
+            self.anomaly_bn1_weight,
+            self.anomaly_bn1_bias,
+            training=False,
+            eps=1e-5,
+        )
+        h = torch.relu(h)
+        logit = F.linear(h, self.anomaly_fc2_weight, self.anomaly_fc2_bias).squeeze(1)
+        anomaly_score = torch.sigmoid(logit)  # (B,)
         return logits, anomaly_score
 
 
@@ -183,8 +221,12 @@ def _detect_num_classes(state_dict: dict, num_classes_arg: int | None) -> int:
     return num_classes_arg
 
 
-def _detect_mahalanobis(state_dict: dict) -> bool:
-    key = "mahal.threshold"
+def _detect_anomaly_classifier(state_dict: dict) -> bool:
+    """AnomalyClassifier がフィット済みかどうかを検出する。
+
+    anomaly.threshold が有限値であれば fit 済みとみなす。
+    """
+    key = "anomaly.threshold"
     if key not in state_dict:
         return False
     val = float(state_dict[key])
@@ -198,11 +240,11 @@ def load_model_for_export(
 ) -> tuple[ClassificationModel | ClassificationWithAnomalyModel, bool]:
     """Load checkpoint and return inference-ready export wrapper.
 
-    Returns ``(model, has_mahal)``.
+    Returns ``(model, has_anomaly)``.
     """
     state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     detected_nc = _detect_num_classes(state_dict, num_classes)
-    has_mahal = _detect_mahalanobis(state_dict)
+    has_anomaly = _detect_anomaly_classifier(state_dict)
 
     full_model = FaceRecognitionModel(
         backbone_name=run_cfg.backbone,
@@ -217,21 +259,21 @@ def load_model_for_export(
     full_model.load_state_dict(state_dict)
     full_model.eval()
 
-    if has_mahal:
-        threshold = float(state_dict["mahal.threshold"])
+    if has_anomaly:
+        threshold = float(state_dict["anomaly.threshold"])
         print(
-            f"  Mahalanobis detected (threshold={threshold:.4f}) "
+            f"  AnomalyClassifier detected (threshold={threshold:.4f}) "
             f"→ ClassificationWithAnomalyModel"
         )
         export_model: ClassificationModel | ClassificationWithAnomalyModel = (
             ClassificationWithAnomalyModel(full_model)
         )
     else:
-        print("  No Mahalanobis → ClassificationModel (logits only)")
+        print("  No AnomalyClassifier → ClassificationModel (logits only)")
         export_model = ClassificationModel(full_model)
 
     export_model.eval()
-    return export_model, has_mahal
+    return export_model, has_anomaly
 
 
 # ──────────────────────────────────────────────
@@ -245,13 +287,13 @@ def export_fp32_onnx(
     img_cfg: ImageConfig,
     num_classes: int,
     class_names: list[str],
-    has_mahal: bool = False,
+    has_anomaly: bool = False,
 ) -> None:
     """Export PyTorch model to fp32 ONNX with dynamic batch and metadata."""
     print(f"Exporting fp32 ONNX to: {onnx_path}")
     dummy_input = torch.randn(1, 3, img_cfg.input_size, img_cfg.input_size)
 
-    if has_mahal:
+    if has_anomaly:
         output_names = ["logits", "anomaly_score"]
         dynamic_axes = {
             "input": {0: "batch_size"},
@@ -290,6 +332,9 @@ def export_fp32_onnx(
     # Make graph I/O batch dim symbolic
     onnx_model = onnx.load(onnx_path)
     make_batch_dim_dynamic(onnx_model)
+    fixed_vi = make_intermediate_batch_dims_dynamic(onnx_model)
+    if fixed_vi:
+        print(f"  Fixed {fixed_vi} intermediate value_info batch dims to dynamic")
     onnx.save(onnx_model, onnx_path)
 
     # Verify dynamic batch
@@ -300,7 +345,7 @@ def export_fp32_onnx(
         num_classes=num_classes,
         rng=np.random.default_rng(0),
         label="fp32",
-        has_mahal=has_mahal,
+        has_anomaly=has_anomaly,
     )
 
     onnx_model = onnx.load(onnx_path)
@@ -319,12 +364,12 @@ def export_fp32_onnx(
     std_entry.key = "imagenet_std"
     std_entry.value = json.dumps(img_cfg.std)
 
-    if has_mahal and isinstance(cls_model, ClassificationWithAnomalyModel):
-        threshold_val = float(cls_model.mahal_threshold.item())
+    if has_anomaly and isinstance(cls_model, ClassificationWithAnomalyModel):
+        threshold_val = float(cls_model.anomaly_threshold.item())
         entry = onnx_model.metadata_props.add()
-        entry.key = "mahal_threshold"
+        entry.key = "anomaly_threshold"
         entry.value = str(threshold_val)
-        print(f"  Embedded mahal_threshold={threshold_val:.6f}")
+        print(f"  Embedded anomaly_threshold={threshold_val:.6f}")
 
     onnx.save(onnx_model, onnx_path)
     print(
@@ -339,7 +384,7 @@ def export_fp32_onnx(
     sess = ort.InferenceSession(onnx_path)
     with torch.no_grad():
         pt_outputs = cls_model(real_tensor)
-    if has_mahal:
+    if has_anomaly:
         pt_logits, pt_anomaly = pt_outputs
         ort_logits, ort_anomaly = sess.run(None, {"input": real_sample})
         compare_outputs(pt_logits.numpy(), ort_logits, label="PyTorch vs fp32 (logits)")
@@ -362,13 +407,13 @@ def export_bf16_onnx(
     img_cfg: ImageConfig,
     num_classes: int,
     class_names: list[str],
-    has_mahal: bool = False,
+    has_anomaly: bool = False,
 ) -> None:
     """Convert fp32 graph to bf16 (weights + activations via Cast)."""
     print(f"\nExporting bf16 ONNX to: {bf16_path}")
     fp32_model = onnx.load(fp32_path)
 
-    bf16_model = convert_graph_to_bf16(fp32_model, has_mahal=has_mahal)
+    bf16_model = convert_graph_to_bf16(fp32_model, has_anomaly=has_anomaly)
     embed_class_metadata(bf16_model, class_names)
     onnx.save(bf16_model, bf16_path)
 
@@ -379,7 +424,7 @@ def export_bf16_onnx(
         num_classes=num_classes,
         rng=np.random.default_rng(3),
         label="bf16",
-        has_mahal=has_mahal,
+        has_anomaly=has_anomaly,
     )
     print(f"  bf16 ONNX saved: {bf16_path}")
 
@@ -394,13 +439,13 @@ def export_fp16_onnx(
     img_cfg: ImageConfig,
     num_classes: int,
     class_names: list[str],
-    has_mahal: bool = False,
+    has_anomaly: bool = False,
 ) -> None:
     """Convert fp32 graph to fp16 (weights + activations)."""
     print(f"\nExporting fp16 ONNX to: {fp16_path}")
     fp32_model = onnx.load(fp32_path)
 
-    fp16_model = convert_graph_to_fp16(fp32_model, has_mahal=has_mahal)
+    fp16_model = convert_graph_to_fp16(fp32_model, has_anomaly=has_anomaly)
     embed_class_metadata(fp16_model, class_names)
     onnx.save(fp16_model, fp16_path)
 
@@ -411,7 +456,7 @@ def export_fp16_onnx(
         num_classes=num_classes,
         rng=np.random.default_rng(2),
         label="fp16",
-        has_mahal=has_mahal,
+        has_anomaly=has_anomaly,
     )
     print(f"  fp16 ONNX saved: {fp16_path}")
 
@@ -431,7 +476,7 @@ def export_block_quantized_onnx(
     img_cfg: ImageConfig,
     num_classes: int,
     class_names: list[str],
-    has_mahal: bool = False,
+    has_anomaly: bool = False,
 ) -> None:
     """Apply per-block quantization to a bf16/fp16 base model.
 
@@ -446,7 +491,7 @@ def export_block_quantized_onnx(
         img_cfg: Image preprocessing config.
         num_classes: Number of classes.
         class_names: Class label names.
-        has_mahal: Whether model has Mahalanobis anomaly detection.
+        has_anomaly: Whether model has AnomalyClassifier.
     """
     label = f"{scale_dtype.value}+{quant_dtype.value}"
     print(f"\nExporting {label} ONNX to: {output_path}")
@@ -457,15 +502,15 @@ def export_block_quantized_onnx(
 
     model = onnx.load(base_reduced_path)
 
-    # Mahalanobis initializers must never be quantized
-    mahal_exclude = get_mahal_initializer_names(model) if has_mahal else set()
+    # AnomalyClassifier initializers must never be quantized
+    anomaly_exclude = get_anomaly_initializer_names(model) if has_anomaly else set()
 
     count = apply_block_quantization(
         model,
         quant_dtype,
         scale_dtype,
         block_size=block_size,
-        exclude_names=mahal_exclude,
+        exclude_names=anomaly_exclude,
         quantize_names=quantize_names,
         # BF16 models: our custom bf16 conversion stores weights as bf16 but
         # inserts Cast(bf16→fp32) nodes so computation runs in fp32.  The
@@ -480,6 +525,12 @@ def export_block_quantized_onnx(
     print(f"  Running shape inference...")
     model = infer_shapes_for_tensorrt(model)
 
+    # shape inference uses batch=1, so intermediate value_info may have
+    # dim_value=1 hardcoded; make them dynamic to suppress ORT warnings
+    fixed_vi = make_intermediate_batch_dims_dynamic(model)
+    if fixed_vi:
+        print(f"  Fixed {fixed_vi} intermediate value_info batch dims to dynamic")
+
     embed_class_metadata(model, class_names)
     onnx.save(model, output_path)
 
@@ -491,7 +542,7 @@ def export_block_quantized_onnx(
         num_classes=num_classes,
         rng=np.random.default_rng(4),
         label=label,
-        has_mahal=has_mahal,
+        has_anomaly=has_anomaly,
     )
 
     # Quick output quality check
@@ -519,7 +570,7 @@ def run_sensitivity_detection(
     output_diff_threshold: float,
     img_cfg: ImageConfig,
     num_probe_samples: int,
-    has_mahal: bool = False,
+    has_anomaly: bool = False,
 ) -> list[str]:
     """Run 2-stage sensitivity detection and return names safe to quantize.
 
@@ -532,7 +583,7 @@ def run_sensitivity_detection(
         output_diff_threshold: Stage 2 threshold.
         img_cfg: Image config for loading probe samples.
         num_probe_samples: Number of probe samples for Stage 2.
-        has_mahal: Whether model has Mahalanobis anomaly detection.
+        has_anomaly: Whether model has AnomalyClassifier.
 
     Returns:
         List of initializer names that are safe to quantize.
@@ -540,16 +591,16 @@ def run_sensitivity_detection(
     # Load probe samples for Stage 2
     probe_samples = load_eval_samples(img_cfg, num_probe_samples, calib_seed=99)
 
-    # Mahalanobis initializers are always excluded
+    # AnomalyClassifier initializers are always excluded
     fp32_model = onnx.load(fp32_path)
-    mahal_exclude = get_mahal_initializer_names(fp32_model) if has_mahal else set()
+    anomaly_exclude = get_anomaly_initializer_names(fp32_model) if has_anomaly else set()
 
     quantize_names, sensitive_names = find_sensitive_initializers(
         fp32_path,
         quant_dtype,
         scale_dtype,
         block_size=block_size,
-        exclude_names=mahal_exclude,
+        exclude_names=anomaly_exclude,
         nrmse_threshold=nrmse_threshold,
         output_diff_threshold=output_diff_threshold,
         probe_samples=probe_samples,
@@ -572,7 +623,7 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         type=str,
         required=True,
-        help="Path to a .pt checkpoint (e.g. model_best_with_mahal.pt)",
+        help="Path to a .pt checkpoint (e.g. model_best_with_anomaly.pt)",
     )
     parser.add_argument(
         "--num-classes",
@@ -688,7 +739,7 @@ def main():
 
     # ── Step 2: Load model ────────────────────────────────────────
     print(f"Loading checkpoint: {checkpoint_path}")
-    cls_model, has_mahal = load_model_for_export(
+    cls_model, has_anomaly = load_model_for_export(
         checkpoint_path, args.num_classes, run_cfg
     )
 
@@ -698,7 +749,7 @@ def main():
         paths["fp32"],
         opset=args.opset,
         img_cfg=img_cfg,
-        has_mahal=has_mahal,
+        has_anomaly=has_anomaly,
         **meta,
     )
 
@@ -707,7 +758,7 @@ def main():
         paths["fp32"],
         paths["bf16"],
         img_cfg=img_cfg,
-        has_mahal=has_mahal,
+        has_anomaly=has_anomaly,
         **meta,
     )
 
@@ -716,7 +767,7 @@ def main():
         paths["fp32"],
         paths["fp16"],
         img_cfg=img_cfg,
-        has_mahal=has_mahal,
+        has_anomaly=has_anomaly,
         **meta,
     )
 
@@ -734,7 +785,7 @@ def main():
         output_diff_threshold=args.output_diff_threshold,
         img_cfg=img_cfg,
         num_probe_samples=args.sensitivity_samples,
-        has_mahal=has_mahal,
+        has_anomaly=has_anomaly,
     )
 
     print("\n" + "=" * 60)
@@ -749,7 +800,7 @@ def main():
         output_diff_threshold=args.output_diff_threshold,
         img_cfg=img_cfg,
         num_probe_samples=args.sensitivity_samples,
-        has_mahal=has_mahal,
+        has_anomaly=has_anomaly,
     )
 
     # ── Step 7: BF16 + INT8 ──────────────────────────────────────
@@ -762,7 +813,7 @@ def main():
         int8_quantize_names,
         block_size=block_size,
         img_cfg=img_cfg,
-        has_mahal=has_mahal,
+        has_anomaly=has_anomaly,
         **meta,
     )
 
@@ -776,7 +827,7 @@ def main():
         fp8_quantize_names,
         block_size=block_size,
         img_cfg=img_cfg,
-        has_mahal=has_mahal,
+        has_anomaly=has_anomaly,
         **meta,
     )
 
@@ -790,7 +841,7 @@ def main():
         int8_quantize_names,
         block_size=block_size,
         img_cfg=img_cfg,
-        has_mahal=has_mahal,
+        has_anomaly=has_anomaly,
         **meta,
     )
 
@@ -804,7 +855,7 @@ def main():
         fp8_quantize_names,
         block_size=block_size,
         img_cfg=img_cfg,
-        has_mahal=has_mahal,
+        has_anomaly=has_anomaly,
         **meta,
     )
 

@@ -36,11 +36,11 @@ def verify_dynamic_batch(
     num_classes: int,
     rng: np.random.Generator | None = None,
     label: str = "",
-    has_mahal: bool = False,
+    has_anomaly: bool = False,
 ) -> None:
     """Run inference with several random batch sizes and assert correct output shape.
 
-    When ``has_mahal=True`` the model outputs two tensors:
+    When ``has_anomaly=True`` the model outputs two tensors:
     - ``outputs[0]``: logits ``(bs, num_classes)``
     - ``outputs[1]``: anomaly_score ``(bs,)``
     Both shapes are verified.
@@ -63,7 +63,7 @@ def verify_dynamic_batch(
         assert out.shape == (bs, num_classes), (
             f"{label} batch={bs}: expected ({bs}, {num_classes}), got {out.shape}"
         )
-        if has_mahal:
+        if has_anomaly:
             assert len(outputs) >= 2, (
                 f"{label} batch={bs}: expected 2 outputs (logits + anomaly_score), "
                 f"got {len(outputs)}"

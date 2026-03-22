@@ -1,8 +1,8 @@
 """ONNX inference script with mistake ranking and wrong-sample saving.
 
-Runs inference over the entire training dataset using an exported ONNX model,
-builds a confusion-based mistake ranking, and saves misclassified images in a
-structured directory layout.
+Runs inference over the training dataset (and the errors dataset) using an
+exported ONNX model, builds a confusion-based mistake ranking, and saves
+misclassified images in a structured directory layout.
 
 Directory layout of saved results::
 
@@ -10,11 +10,8 @@ Directory layout of saved results::
         wrong_predictions.csv          # all misclassified samples (metadata)
         confusion_ranking.csv          # (true_class, pred_class, count) sorted by count desc
         class_accuracy.csv             # per-class accuracy sorted by accuracy asc
-        wrong_images/
-            <pred_class>/              # directory named after the predicted (wrong) label
-                <true_class>_001.jpg   # original image; counter is per (pred, true) pair
-                <true_class>_002.jpg
-                ...
+        errors_predictions.csv         # predictions for the errors dataset (no ground truth)
+        distribution_anomaly_score.png # anomaly score histogram (train vs errors)
 
 Execution Providers::
 
@@ -33,6 +30,14 @@ TensorRT options (only used when provider is ``tensorrt`` or ``auto`` selects it
     --trt-cache-dir DIR    Directory for caching compiled TensorRT engines
                            (default: <output_dir>/trt_cache).  Caching dramatically
                            speeds up subsequent runs with the same model.
+
+TensorRT batch padding::
+
+    When TensorRT is active (``--provider tensorrt`` or ``auto`` selects it),
+    every batch — including the final (potentially smaller) batch — is
+    zero-padded to ``batch_size`` before inference and the dummy results are
+    discarded afterward.  This prevents TensorRT from recompiling a new engine
+    for the last batch and keeps latency consistent across all batches.
 
 Usage::
 
@@ -55,6 +60,11 @@ Usage::
         --onnx hp_finetune/work_dirs/20260320_125319/model_best.onnx \\
         --output-dir results/infer_onnx \\
         --top-k 30
+
+    # Limit to first 1000 samples (training + errors datasets)
+    python hp_finetune/infer_onnx.py \\
+        --onnx hp_finetune/work_dirs/20260320_125319/model_best.onnx \\
+        --max-samples 1000
 """
 
 from __future__ import annotations
@@ -64,7 +74,7 @@ import csv
 import json
 import os
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -73,7 +83,10 @@ import onnxruntime as ort
 from scipy.special import softmax
 from tqdm import tqdm
 
-from hp_finetune.data_utils import get_inference_transform, load_train_dataset
+from hp_finetune.data_utils import (
+    load_train_dataset,
+    make_inference_loader,
+)
 
 # ──────────────────────────────────────────────
 # Constants
@@ -307,14 +320,14 @@ def _load_image_config_from_onnx(
     return input_size, mean, std
 
 
-def _load_mahal_threshold_from_onnx(sess: ort.InferenceSession) -> float | None:
-    """Read Mahalanobis threshold from ONNX metadata_props.
+def _load_anomaly_threshold_from_onnx(sess: ort.InferenceSession) -> float | None:
+    """Read anomaly threshold from ONNX metadata_props.
 
     Returns the threshold value if present, or ``None`` if the model was
-    exported without Mahalanobis anomaly detection.
+    exported without AnomalyClassifier.
     """
     meta = sess.get_modelmeta().custom_metadata_map
-    val = meta.get("mahal_threshold")
+    val = meta.get("anomaly_threshold")
     return float(val) if val is not None else None
 
 
@@ -326,6 +339,40 @@ def _has_anomaly_output(sess: ort.InferenceSession) -> bool:
 # ──────────────────────────────────────────────
 # Inference
 # ──────────────────────────────────────────────
+DEFAULT_BATCH_SIZE = 32
+
+
+def _iter_batches(dataset, batch_size: int):
+    """Yield successive index-batches from a HuggingFace dataset."""
+    n = len(dataset)
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        yield dataset[start:end]
+
+
+def _pad_batch(x: np.ndarray, target_bs: int) -> tuple[np.ndarray, int]:
+    """Zero-pad the first dimension of *x* to *target_bs* if necessary.
+
+    TensorRT compiles a separate engine for each unique input shape.  When the
+    last batch is smaller than ``batch_size`` a new (slow) engine compilation
+    is triggered.  Padding every batch to the same size avoids this.
+
+    Args:
+        x:         Input array of shape ``(B, C, H, W)`` where ``B <= target_bs``.
+        target_bs: Target batch size (must be >= ``x.shape[0]``).
+
+    Returns:
+        ``(padded_x, orig_n)`` — the zero-padded array and the original batch
+        length so the caller can slice away the dummy results.
+    """
+    orig_n = x.shape[0]
+    if orig_n == target_bs:
+        return x, orig_n
+    pad_n = target_bs - orig_n
+    pad = np.zeros((pad_n, *x.shape[1:]), dtype=x.dtype)
+    return np.concatenate([x, pad], axis=0), orig_n
+
+
 def run_inference(
     sess: ort.InferenceSession,
     class_names: list[str],
@@ -334,105 +381,286 @@ def run_inference(
     std: list[float],
     *,
     has_anomaly: bool = False,
-) -> tuple[list[int], list[int], list[np.ndarray], list[float], list[float | None]]:
-    """Run inference over the full dataset.
+    max_samples: int | None = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+) -> tuple[list[int], list[int], list[float], list[float | None]]:
+    """Run batched inference over the training dataset.
+
+    Args:
+        max_samples: Maximum number of samples to process. ``None`` means all.
+        batch_size:  Number of images to feed per ORT call (default: 32).
 
     Returns:
         true_labels:    list of ground-truth integer class indices
         pred_labels:    list of predicted integer class indices
-        images:         list of original PIL images (RGB, not transformed)
         confidences:    list of softmax confidence for the predicted class
-        anomaly_scores: list of Mahalanobis anomaly scores, or ``None`` per
+        anomaly_scores: list of anomaly scores, or ``None`` per
                         sample when the model has no anomaly detection output
     """
     from hp_finetune.data_utils import ImageConfig
 
     img_cfg = ImageConfig(input_size=input_size, mean=mean, std=std)
-    transform = get_inference_transform(img_cfg)
 
     print("Loading dataset...")
     dataset = load_train_dataset()
-    print(f"  Dataset size: {len(dataset)} samples")
+    total = len(dataset)
+    if max_samples is not None and max_samples < total:
+        print(f"  Dataset size: {total} samples  (limiting to {max_samples})")
+        dataset = dataset.select(range(max_samples))
+    else:
+        print(f"  Dataset size: {total} samples")
+    print(f"  Batch size: {batch_size}")
 
-    input_name = sess.get_inputs()[0].name  # "input"
+    loader = make_inference_loader(dataset, img_cfg, batch_size)
+    input_name = sess.get_inputs()[0].name
 
     true_labels: list[int] = []
     pred_labels: list[int] = []
-    images: list = []
     confidences: list[float] = []
     anomaly_scores: list[float | None] = []
 
-    for item in tqdm(dataset, desc="Inference", unit="img"):
-        img = item["image"].convert("RGB")
-        true_label: int = int(item["label"])
+    n = len(dataset)
+    with tqdm(total=n, desc="Inference", unit="img") as pbar:
+        for x_batch, imgs_pil, batch_true in loader:
+            x = x_batch.numpy()
+            x, orig_n = _pad_batch(x, batch_size)
 
-        x = transform(img).unsqueeze(0).numpy().astype(np.float32)
-        outputs = sess.run(None, {input_name: x})
-        logits = outputs[0][0]  # (num_classes,)
-        anomaly = float(outputs[1][0]) if has_anomaly else None
+            outputs = sess.run(None, {input_name: x})
+            logits_batch = outputs[0][:orig_n]  # (B, num_classes)
+            # anomaly_score output shape is (B,) — use flat indexing
+            anomaly_batch = (
+                outputs[1].ravel()[:orig_n].tolist() if has_anomaly else None
+            )
 
-        pred_label = int(np.argmax(logits))
-        probs = softmax(logits.astype(np.float64))
-        confidence = float(probs[pred_label])
+            probs_batch = softmax(logits_batch.astype(np.float64), axis=1)
+            preds = np.argmax(logits_batch, axis=1).tolist()
 
-        true_labels.append(true_label)
-        pred_labels.append(pred_label)
-        images.append(img)
-        confidences.append(confidence)
-        anomaly_scores.append(anomaly)
+            for i, (pred_label, true_label) in enumerate(zip(preds, batch_true)):
+                confidence = float(probs_batch[i, pred_label])
+                anomaly = float(anomaly_batch[i]) if anomaly_batch is not None else None
 
-    return true_labels, pred_labels, images, confidences, anomaly_scores
+                true_labels.append(true_label)
+                pred_labels.append(pred_label)
+                confidences.append(confidence)
+                anomaly_scores.append(anomaly)
+
+            pbar.update(len(imgs_pil))
+
+    return true_labels, pred_labels, confidences, anomaly_scores
+
+
+def run_inference_errors(
+    sess: ort.InferenceSession,
+    input_size: int,
+    mean: list[float],
+    std: list[float],
+    *,
+    has_anomaly: bool = False,
+    max_samples: int | None = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+) -> tuple[list[int], list[float], list[float | None]]:
+    """Run batched inference over the errors dataset (no ground-truth labels).
+
+    The errors dataset (``yayoimizuha/helloproject-face-errors``) contains
+    images that should *not* match any known class (i.e. non-member faces or
+    out-of-distribution images).  There are no label annotations, so only
+    predictions and confidence scores are returned.
+
+    Args:
+        max_samples: Maximum number of samples to process. ``None`` means all.
+        batch_size:  Number of images to feed per ORT call (default: 32).
+
+    Returns:
+        pred_labels:    list of predicted integer class indices
+        confidences:    list of softmax confidence for the predicted class
+        anomaly_scores: list of anomaly scores, or ``None`` per
+                        sample when the model has no anomaly detection output
+    """
+    from datasets import load_dataset
+
+    from hp_finetune.data_utils import ImageConfig
+
+    img_cfg = ImageConfig(input_size=input_size, mean=mean, std=std)
+
+    errors_dataset_name = "yayoimizuha/helloproject-face-errors"
+    print(f"Loading errors dataset ({errors_dataset_name})...")
+    error_raw = load_dataset(errors_dataset_name)
+    split_name = list(error_raw.keys())[0]
+    dataset = error_raw[split_name]
+    total = len(dataset)
+    if max_samples is not None and max_samples < total:
+        print(f"  Errors dataset size: {total} samples  (limiting to {max_samples})")
+        dataset = dataset.select(range(max_samples))
+    else:
+        print(f"  Errors dataset size: {total} samples")
+    print(f"  Batch size: {batch_size}")
+
+    loader = make_inference_loader(dataset, img_cfg, batch_size)
+    input_name = sess.get_inputs()[0].name
+
+    pred_labels: list[int] = []
+    confidences: list[float] = []
+    anomaly_scores: list[float | None] = []
+
+    n = len(dataset)
+    with tqdm(total=n, desc="Inference (errors)", unit="img") as pbar:
+        for x_batch, imgs_pil, _labels in loader:
+            x = x_batch.numpy()
+            x, orig_n = _pad_batch(x, batch_size)
+
+            outputs = sess.run(None, {input_name: x})
+            logits_batch = outputs[0][:orig_n]
+            anomaly_batch = (
+                outputs[1].ravel()[:orig_n].tolist() if has_anomaly else None
+            )
+
+            probs_batch = softmax(logits_batch.astype(np.float64), axis=1)
+            preds = np.argmax(logits_batch, axis=1).tolist()
+
+            for i, pred_label in enumerate(preds):
+                confidence = float(probs_batch[i, pred_label])
+                anomaly = float(anomaly_batch[i]) if anomaly_batch is not None else None
+
+                pred_labels.append(pred_label)
+                confidences.append(confidence)
+                anomaly_scores.append(anomaly)
+
+            pbar.update(len(imgs_pil))
+
+    return pred_labels, confidences, anomaly_scores
 
 
 # ──────────────────────────────────────────────
-# Saving wrong samples
+# Record builders (CSV only — no image saving)
 # ──────────────────────────────────────────────
-def save_wrong_images(
-    true_labels: list[int],
+def _build_errors_records(
     pred_labels: list[int],
-    images: list,
     confidences: list[float],
     class_names: list[str],
-    output_dir: str,
     *,
     anomaly_scores: list[float | None] | None = None,
-    mahal_threshold: float | None = None,
+    anomaly_threshold: float | None = None,
 ) -> list[dict]:
-    """Save misclassified images under <output_dir>/wrong_images/<pred>/<true>_NNN.jpg.
+    """Build per-sample record dicts for the errors dataset (no image saving)."""
+    records: list[dict] = []
+    _anomaly_scores = anomaly_scores or [None] * len(pred_labels)
+
+    for idx, (pred_lbl, conf, anomaly) in enumerate(
+        zip(pred_labels, confidences, _anomaly_scores)
+    ):
+        record: dict = {
+            "dataset_index": idx,
+            "pred_label_idx": pred_lbl,
+            "pred_class": class_names[pred_lbl],
+            "confidence": f"{conf:.6f}",
+        }
+        if anomaly is not None:
+            record["anomaly_score"] = f"{anomaly:.6f}"
+            if anomaly_threshold is not None:
+                record["is_anomaly"] = "1" if anomaly > anomaly_threshold else "0"
+        records.append(record)
+
+    return records
+
+
+def save_errors_predictions_csv(records: list[dict], output_dir: str) -> str:
+    """Write errors_predictions.csv and return its path."""
+    path = os.path.join(output_dir, "errors_predictions.csv")
+    if not records:
+        print("  No errors records — skipping CSV.")
+        return path
+
+    fieldnames = [
+        "dataset_index",
+        "pred_label_idx",
+        "pred_class",
+        "confidence",
+    ]
+    if records and "anomaly_score" in records[0]:
+        fieldnames.append("anomaly_score")
+    if records and "is_anomaly" in records[0]:
+        fieldnames.append("is_anomaly")
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(records)
+
+    return path
+
+
+def print_errors_summary(
+    pred_labels: list[int],
+    class_names: list[str],
+    top_k: int,
+    *,
+    anomaly_scores: list[float | None] | None = None,
+    anomaly_threshold: float | None = None,
+) -> None:
+    """Print a summary of errors-dataset inference results."""
+    from collections import Counter as _Counter
+
+    total = len(pred_labels)
+    pred_counter = _Counter(pred_labels)
+
+    print()
+    print("=" * 60)
+    print("Errors Dataset Inference Summary")
+    print("=" * 60)
+    print(f"  Total samples : {total}")
+    print()
+
+    if anomaly_scores is not None and any(s is not None for s in anomaly_scores):
+        valid_scores = [s for s in anomaly_scores if s is not None]
+        mean_score = float(np.mean(valid_scores))
+        print("Anomaly Detection (AnomalyClassifier)")
+        print("-" * 60)
+        if anomaly_threshold is not None:
+            anomaly_count = sum(1 for s in valid_scores if s > anomaly_threshold)
+            anomaly_rate = anomaly_count / len(valid_scores) * 100
+            print(f"  threshold        : {anomaly_threshold:.4f}")
+            print(
+                f"  anomaly detected : {anomaly_count} / {len(valid_scores)} samples"
+                f" ({anomaly_rate:.2f}%)"
+            )
+        print(f"  mean score (all) : {mean_score:.4f}")
+        print(f"  min / max score  : {min(valid_scores):.4f} / {max(valid_scores):.4f}")
+        print()
+
+    print(f"Top-{top_k} Predicted Classes (errors dataset)")
+    print("-" * 60)
+    for rank, (cls_idx, cnt) in enumerate(pred_counter.most_common(top_k), 1):
+        pct = cnt / total * 100
+        print(f"  {rank:3d}. {class_names[cls_idx]:<40s}  {cnt:5d}  ({pct:.2f}%)")
+    print("=" * 60)
+
+
+# ──────────────────────────────────────────────
+# Wrong sample record builder (CSV only — no image saving)
+# ──────────────────────────────────────────────
+def _build_wrong_records(
+    true_labels: list[int],
+    pred_labels: list[int],
+    confidences: list[float],
+    class_names: list[str],
+    *,
+    anomaly_scores: list[float | None] | None = None,
+    anomaly_threshold: float | None = None,
+) -> list[dict]:
+    """Build per-sample record dicts for misclassified samples (no image saving).
 
     Returns a list of dicts (one per wrong sample) for CSV output.
     Includes ``anomaly_score`` and ``is_anomaly`` columns when *anomaly_scores*
     is provided.
     """
-    wrong_images_dir = os.path.join(output_dir, "wrong_images")
-
-    # Counter to track the sequential number per (pred_class, true_class) pair
-    pair_counters: dict[tuple[int, int], int] = defaultdict(int)
-
     records: list[dict] = []
-
     _anomaly_scores = anomaly_scores or [None] * len(true_labels)
 
-    for idx, (true_lbl, pred_lbl, img, conf, anomaly) in enumerate(
-        zip(true_labels, pred_labels, images, confidences, _anomaly_scores)
+    for idx, (true_lbl, pred_lbl, conf, anomaly) in enumerate(
+        zip(true_labels, pred_labels, confidences, _anomaly_scores)
     ):
         if true_lbl == pred_lbl:
             continue
-
-        true_name = _safe_name(class_names[true_lbl])
-        pred_name = _safe_name(class_names[pred_lbl])
-
-        # Directory: wrong_images/<pred_class>/
-        img_dir = os.path.join(wrong_images_dir, pred_name)
-        os.makedirs(img_dir, exist_ok=True)
-
-        # Filename: <true_class>_NNN.jpg
-        pair_counters[(pred_lbl, true_lbl)] += 1
-        seq = pair_counters[(pred_lbl, true_lbl)]
-        filename = f"{true_name}_{seq:03d}.jpg"
-        filepath = os.path.join(img_dir, filename)
-
-        img.save(filepath, format="JPEG", quality=90)
 
         record: dict = {
             "dataset_index": idx,
@@ -441,12 +669,11 @@ def save_wrong_images(
             "true_class": class_names[true_lbl],
             "pred_class": class_names[pred_lbl],
             "confidence": f"{conf:.6f}",
-            "image_path": os.path.relpath(filepath, output_dir),
         }
         if anomaly is not None:
             record["anomaly_score"] = f"{anomaly:.6f}"
-            if mahal_threshold is not None:
-                record["is_anomaly"] = "1" if anomaly > mahal_threshold else "0"
+            if anomaly_threshold is not None:
+                record["is_anomaly"] = "1" if anomaly > anomaly_threshold else "0"
         records.append(record)
 
     return records
@@ -459,7 +686,7 @@ def save_wrong_predictions_csv(records: list[dict], output_dir: str) -> str:
     """Write wrong_predictions.csv and return its path.
 
     Columns ``anomaly_score`` and ``is_anomaly`` are written when present in
-    *records* (i.e. when the model was exported with Mahalanobis detection).
+    *records* (i.e. when the model was exported with AnomalyClassifier).
     """
     path = os.path.join(output_dir, "wrong_predictions.csv")
     if not records:
@@ -474,9 +701,7 @@ def save_wrong_predictions_csv(records: list[dict], output_dir: str) -> str:
         "true_class",
         "pred_class",
         "confidence",
-        "image_path",
     ]
-    # Append anomaly columns if the first record has them
     if "anomaly_score" in records[0]:
         fieldnames.append("anomaly_score")
     if "is_anomaly" in records[0]:
@@ -573,7 +798,7 @@ def print_summary(
     top_k: int,
     *,
     anomaly_scores: list[float | None] | None = None,
-    mahal_threshold: float | None = None,
+    anomaly_threshold: float | None = None,
     top_class_k: int = DEFAULT_TOP_CLASS_K,
 ) -> None:
     from collections import Counter as _Counter
@@ -597,12 +822,12 @@ def print_summary(
         valid_scores = [s for s in anomaly_scores if s is not None]
         mean_score = float(np.mean(valid_scores))
         print()
-        print("Anomaly Detection (Mahalanobis)")
+        print("Anomaly Detection (AnomalyClassifier)")
         print("-" * 60)
-        if mahal_threshold is not None:
-            anomaly_count = sum(1 for s in valid_scores if s > mahal_threshold)
+        if anomaly_threshold is not None:
+            anomaly_count = sum(1 for s in valid_scores if s > anomaly_threshold)
             anomaly_rate = anomaly_count / len(valid_scores) * 100
-            print(f"  threshold        : {mahal_threshold:.4f}")
+            print(f"  threshold        : {anomaly_threshold:.4f}")
             print(
                 f"  anomaly detected : {anomaly_count} / {len(valid_scores)} samples"
                 f" ({anomaly_rate:.2f}%)"
@@ -652,6 +877,119 @@ def print_summary(
 
 
 # ──────────────────────────────────────────────
+# Distribution plots
+# ──────────────────────────────────────────────
+def save_anomaly_score_plot(
+    train_anomaly_scores: list[float | None] | None,
+    errors_anomaly_scores: list[float | None] | None,
+    output_dir: str,
+    *,
+    anomaly_threshold: float | None = None,
+) -> str | None:
+    """Save an anomaly score histogram (positive vs negative).
+
+    The anomaly score is the sigmoid output of AnomalyClassifier, so it is
+    strictly in the range (0, 1).  Bins are 0.05-wide: [0.00, 0.05),
+    [0.05, 0.10), ..., [0.95, 1.00].
+    Both series are normalised to percentage within each dataset so that the
+    shape is comparable regardless of sample-count imbalance.
+    Returns the saved file path, or ``None`` if no scores were provided.
+    """
+    _train_scores = (
+        [s for s in train_anomaly_scores if s is not None]
+        if train_anomaly_scores
+        else []
+    )
+    _errors_scores = (
+        [s for s in errors_anomaly_scores if s is not None]
+        if errors_anomaly_scores
+        else []
+    )
+
+    if not _train_scores and not _errors_scores:
+        return None
+
+    import matplotlib
+
+    matplotlib.use("Agg")  # headless backend
+    import matplotlib.pyplot as plt
+
+    try:
+        import matplotlib_fontja  # noqa: F401  registers Japanese font
+    except ImportError:
+        pass
+
+    # 20 bins of width 0.05 covering [0, 1]
+    BIN_WIDTH = 0.05
+    N_BINS = 20
+    bin_edges = [round(i * BIN_WIDTH, 10) for i in range(N_BINS + 1)]
+    labels = [f"{bin_edges[i]:.2f}" for i in range(N_BINS)]
+
+    def _to_bin_counts(scores: list[float]) -> np.ndarray:
+        counts = np.zeros(N_BINS, dtype=int)
+        for s in scores:
+            # clamp to [0, 1) then bucket; scores exactly == 1.0 go to last bin
+            idx = min(int(s / BIN_WIDTH), N_BINS - 1)
+            counts[idx] += 1
+        return counts
+
+    train_counts = _to_bin_counts(_train_scores)
+    errors_counts = _to_bin_counts(_errors_scores)
+
+    # Normalise to % within each dataset
+    train_pct = train_counts / max(len(_train_scores), 1) * 100
+    errors_pct = errors_counts / max(len(_errors_scores), 1) * 100
+
+    x = np.arange(N_BINS)
+    w = 0.4
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    if _train_scores:
+        ax.bar(
+            x - w / 2,
+            train_pct,
+            w,
+            label=f"正例 (train, n={len(_train_scores)})",
+            color="#4C8BE2",
+            alpha=0.85,
+        )
+    if _errors_scores:
+        ax.bar(
+            x + w / 2,
+            errors_pct,
+            w,
+            label=f"負例 (errors, n={len(_errors_scores)})",
+            color="#E2824C",
+            alpha=0.85,
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_xlabel("異常スコア (ビン幅 = 0.05)")
+    ax.set_ylabel("割合 (%)")
+    ax.set_title("異常スコアの分布 — 正例 vs 負例 (各データセット内の割合)")
+
+    if anomaly_threshold is not None:
+        # Convert threshold value to x-axis position
+        thr_x = anomaly_threshold / BIN_WIDTH - 0.5
+        ax.axvline(
+            thr_x,
+            color="red",
+            linestyle="--",
+            linewidth=1.5,
+            label=f"閾値 = {anomaly_threshold:.4f}",
+        )
+
+    ax.legend()
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    path = os.path.join(output_dir, "distribution_anomaly_score.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+# ──────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:
@@ -677,6 +1015,23 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Directory to save results. "
             "Defaults to <onnx_dir>/infer_results/<onnx_stem>."
+        ),
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        metavar="N",
+        help=f"Batch size for ONNX inference (default: {DEFAULT_BATCH_SIZE})",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Maximum number of samples to process from the training dataset. "
+            "Defaults to all samples when not specified."
         ),
     )
     parser.add_argument(
@@ -787,32 +1142,35 @@ def main() -> None:
     class_names = _load_class_names_from_onnx(sess)
     input_size, mean, std = _load_image_config_from_onnx(sess)
     has_anomaly = _has_anomaly_output(sess)
-    mahal_threshold = _load_mahal_threshold_from_onnx(sess) if has_anomaly else None
+    anomaly_threshold = _load_anomaly_threshold_from_onnx(sess) if has_anomaly else None
     print(
         f"  num_classes={len(class_names)}  "
         f"input_size={input_size}  mean={mean}  std={std}"
     )
     if has_anomaly:
-        print(f"  Mahalanobis anomaly detection: enabled  threshold={mahal_threshold}")
+        print(f"  AnomalyClassifier: enabled  threshold={anomaly_threshold}")
 
     # ── 2. Run inference ────────────────────────────────────────────
-    true_labels, pred_labels, images, confidences, anomaly_scores = run_inference(
-        sess, class_names, input_size, mean, std, has_anomaly=has_anomaly
+    true_labels, pred_labels, confidences, anomaly_scores = run_inference(
+        sess,
+        class_names,
+        input_size,
+        mean,
+        std,
+        has_anomaly=has_anomaly,
+        max_samples=args.max_samples,
+        batch_size=args.batch_size,
     )
 
-    # ── 3. Save wrong images ────────────────────────────────────────
-    print("Saving wrong images...")
-    wrong_records = save_wrong_images(
+    # ── 3. Build wrong predictions records ─────────────────────────
+    wrong_records = _build_wrong_records(
         true_labels,
         pred_labels,
-        images,
         confidences,
         class_names,
-        output_dir,
         anomaly_scores=anomaly_scores,
-        mahal_threshold=mahal_threshold,
+        anomaly_threshold=anomaly_threshold,
     )
-    print(f"  Saved {len(wrong_records)} wrong images")
 
     # ── 4. Save wrong_predictions.csv ──────────────────────────────
     csv_path = save_wrong_predictions_csv(wrong_records, output_dir)
@@ -838,9 +1196,60 @@ def main() -> None:
         ranking,
         args.top_k,
         anomaly_scores=anomaly_scores,
-        mahal_threshold=mahal_threshold,
+        anomaly_threshold=anomaly_threshold,
         top_class_k=args.top_class_k,
     )
+
+    # ── 8. Errors dataset inference ─────────────────────────────────
+    print()
+    print("Running inference on errors dataset...")
+    errors_pred_labels, errors_confidences, errors_anomaly_scores = (
+        run_inference_errors(
+            sess,
+            input_size,
+            mean,
+            std,
+            has_anomaly=has_anomaly,
+            max_samples=args.max_samples,
+            batch_size=args.batch_size,
+        )
+    )
+
+    # ── 9. Build errors records ─────────────────────────────────────
+    errors_records = _build_errors_records(
+        errors_pred_labels,
+        errors_confidences,
+        class_names,
+        anomaly_scores=errors_anomaly_scores,
+        anomaly_threshold=anomaly_threshold,
+    )
+
+    # ── 10. Save errors_predictions.csv ────────────────────────────
+    errors_csv_path = save_errors_predictions_csv(errors_records, output_dir)
+    print(f"  Saved: {errors_csv_path}")
+
+    # ── 11. Print errors summary ────────────────────────────────────
+    print_errors_summary(
+        errors_pred_labels,
+        class_names,
+        args.top_k,
+        anomaly_scores=errors_anomaly_scores,
+        anomaly_threshold=anomaly_threshold,
+    )
+
+    # ── 12. Save anomaly score distribution plot ───────────────────────
+    print()
+    print("Saving anomaly score distribution plot...")
+    anomaly_plot = save_anomaly_score_plot(
+        anomaly_scores,
+        errors_anomaly_scores,
+        output_dir,
+        anomaly_threshold=anomaly_threshold,
+    )
+    if anomaly_plot:
+        print(f"  Saved: {anomaly_plot}")
+    else:
+        print("  Skipped (no anomaly scores available)")
 
 
 if __name__ == "__main__":
