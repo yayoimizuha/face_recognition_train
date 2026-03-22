@@ -1,9 +1,9 @@
 """
 Fine-tuning script for face recognition using the helloproject-face-dataset dataset.
-Single GPU, ArcFace loss, ConvNeXt V2 Large backbone with GWAP.
+Single GPU, ArcFace loss, MobileNetV4-Hybrid-Medium backbone with GWAP.
 
 Architecture:
-    backbone (timm convnextv2_large features) → GWAP → Linear+BN+SiLU+Dropout → Linear → embedding
+    backbone (timm mobilenetv4_hybrid_medium features) → GWAP → Linear+BN+SiLU+Dropout → Linear → embedding
 
 After ArcFace training, Mahalanobis distance-based anomaly detection is fitted:
     - Positive examples: yayoimizuha/helloproject-face-dataset (all samples)
@@ -49,16 +49,16 @@ from tqdm import tqdm
 # ──────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────
-BACKBONE = "timm/convnextv2_large.fcmae_ft_in22k_in1k"
-BACKBONE_DIM = 1536  # convnextv2_large forward_features output channels
+BACKBONE = "timm/mobilenetv4_hybrid_medium.e500_r224_in1k"
+BACKBONE_DIM = 960  # mobilenetv4_hybrid_medium の forward_features 出力チャンネル数
 HIDDEN_DIM = 1024  # embedding head の中間層次元
 EMB_SIZE = 512
 INPUT_SIZE = 224  # 事前学習時と同じ解像度
 DROPOUT = 0.3  # embedding head の Dropout 率
 NUM_EPOCHS = 150
-BATCH_SIZE = 32
+BATCH_SIZE = 128
 LR = 3e-3  # head / GWAP / ArcFace 用
-LR_BACKBONE = 1e-4  # 事前学習済み backbone 用（head の 1/10）
+LR_BACKBONE = 3e-4  # 事前学習済み backbone 用（head の 1/10）
 WEIGHT_DECAY = 5e-4
 ARC_S = 30.0
 ARC_M = 0.5
@@ -182,26 +182,34 @@ class GWAP(nn.Module):
 # Mahalanobis Distance Layer
 # ──────────────────────────────────────────────
 class MahalanobisLayer(nn.Module):
-    """マハラノビス距離計算モジュール。
+    """Multi-class マハラノビス距離計算モジュール（Tied covariance）。
 
-    fit() で正例 embedding の統計量（平均・精度行列）を設定し、
-    forward() で各 embedding のマハラノビス距離を返す。
+    fit() でクラスごとの embedding 平均と Pooled within-class 精度行列を設定し、
+    forward() で各 embedding の「最近クラスへのマハラノビス距離」を返す。
+
+    設計:
+        - class_means: (num_classes, D) — クラスごとの embedding 平均
+        - precision:   (D, D)          — 全クラス共通の Pooled within-class 精度行列
+        - threshold:   scalar          — 異常検知閾値（Youden's J で設定）
+
+    推論:
+        d(x) = min_c sqrt((x - μ_c)^T Σ_w^{-1} (x - μ_c))
+        スコアが大きいほど異常（全クラスから外れた入力）
 
     統計量と閾値は nn.Buffer として保持されるため、state_dict に含まれ、
     .pt ファイルへの保存・復元、および ONNX エクスポートに対応する。
 
     NOTE: 精度を重視して生の（正規化前の）embedding を入力として使用する。
           ArcFace の embedding head 出力（emb_size 次元）をそのまま渡す。
-
-    数式:
-        d(x) = sqrt((x - μ)^T Σ^{-1} (x - μ))
     """
 
-    def __init__(self, emb_size: int):
+    def __init__(self, emb_size: int, num_classes: int = 1):
         super().__init__()
         self.emb_size = emb_size
+        self.num_classes = num_classes
         # バッファ: 勾配不要、state_dict に含まれる
-        self.register_buffer("mean", torch.zeros(emb_size))
+        # class_means: (num_classes, D) — クラスごとの平均ベクトル
+        self.register_buffer("class_means", torch.zeros(num_classes, emb_size))
         self.register_buffer("precision", torch.eye(emb_size))
         self.register_buffer("threshold", torch.tensor(float("inf")))
 
@@ -210,15 +218,19 @@ class MahalanobisLayer(nn.Module):
         Args:
             x: (B, emb_size) — 生の embedding（正規化前）
         Returns:
-            dist: (B,) — マハラノビス距離（大きいほど異常）
+            dist: (B,) — 最近クラスへのマハラノビス距離（大きいほど異常）
         """
-        diff = x - self.mean  # (B, D)
-        # (B, D) @ (D, D) → (B, D); row-wise dot product → (B,)
-        left = diff @ self.precision  # (B, D)
-        dist_sq = (left * diff).sum(dim=1)  # (B,)
-        dist = dist_sq.clamp(min=0.0).sqrt()  # (B,)
-        # NaN/Inf ガード: 数値的不安定時に 0.0 で置換（downstream が破綻しないよう）
-        return torch.nan_to_num(dist, nan=0.0, posinf=0.0, neginf=0.0)
+        # diff: (B, 1, D) - (1, C, D) = (B, C, D)
+        diff = x.unsqueeze(1) - self.class_means.unsqueeze(0)
+        # (B, C, D) @ (D, D) = (B, C, D)
+        left = diff @ self.precision
+        dist_sq = (left * diff).sum(dim=2)  # (B, C)
+        # 各サンプルについて全クラスの中で最小二乗距離を取る
+        min_dist_sq = dist_sq.clamp(min=0.0).min(dim=1).values  # (B,)
+        dist = min_dist_sq.sqrt()  # (B,)
+        # NaN ガード: 数値的不安定時に 0.0 で置換（距離が算出不能 → 正常扱い）
+        # posinf は inf のまま保持して downstream で異常判定させる
+        return torch.nan_to_num(dist, nan=0.0, neginf=0.0)
 
     def is_fitted(self) -> bool:
         """閾値が有限値であれば fit 済みとみなす。"""
@@ -244,12 +256,12 @@ class FaceRecognitionModel(nn.Module):
         embed(x)                → 生の embedding (backbone + GWAP + head)
         arcface_logits(e, l)    → ArcFace margin 付き logits (loss 計算用)
         cos_logits(e)           → margin なしの cosine logits (推論・val 用)
-        mahalanobis_score(e)    → マハラノビス距離 (異常スコア)
+        mahalanobis_score(e)    → min-class マハラノビス距離 (異常スコア)
 
     forward の挙動:
         train モード : arcface_logits を返す（margin 付き、labels 必須）
         eval  モード : (cos_logits, anomaly_score) タプルを返す
-                       anomaly_score はマハラノビス距離（生の embedding を使用）
+                       anomaly_score = min_c dist(embed, μ_c)（生の embedding を使用）
 
     NOTE: train loss と val loss は margin の有無により非対称になる。
           これは ArcFace の仕様上意図的な挙動であり、両者の絶対値を直接比較
@@ -304,7 +316,7 @@ class FaceRecognitionModel(nn.Module):
         self._mm = math.sin(math.pi - arc_m) * arc_m
 
         # ── Mahalanobis 異常検知 ──────────────────
-        self.mahal = MahalanobisLayer(emb_size)
+        self.mahal = MahalanobisLayer(emb_size, num_classes)
 
     # ------------------------------------------------------------------
     # embedding: backbone + GWAP + head (生の embedding、正規化前)
@@ -390,82 +402,117 @@ def fit_mahalanobis(
     device: torch.device,
     reg_lambda: float = MAHAL_REG_LAMBDA,
 ) -> dict:
-    """ArcFace 学習後に Mahalanobis 異常検知の統計量を計算してモデルに書き込む。
+    """ArcFace 学習後に Multi-class Mahalanobis 異常検知の統計量を計算してモデルに書き込む。
+
+    設計: クラスごとの平均ベクトル + Pooled within-class 精度行列（Tied covariance）
+        - d(x) = min_c sqrt((x - μ_c)^T Σ_w^{-1} (x - μ_c))
+        - ArcFace の特徴空間はクラスが球面上に分散するため、全体平均を使う
+          Global Mahalanobis は機能しない。各クラスの重心との距離を使うことで、
+          正例（学習済みクラスの顔）は小さく、負例（未知顔・非顔）は大きくなる。
 
     手順:
-        1. 正例 (face-dataset 全体) の生 embedding を収集
-        2. 全体の平均 μ と共分散行列 Σ を計算（正則化: Σ += λI）
-        3. 精度行列 Σ^{-1} を計算し、モデルの mean/precision バッファを先行更新
-        4. MahalanobisLayer 経由で正例・負例それぞれのマハラノビス距離を計算
-        5. Youden's J 統計量で最適閾値を決定し、threshold バッファを更新
+        1. 正例 (face-dataset 全体) の生 embedding とラベルを収集
+        2. クラスごとの平均 μ_c を計算
+        3. Pooled within-class 共分散行列 Σ_w を計算し、精度行列 Σ_w^{-1} を求める
+        4. モデルの class_means / precision バッファを更新
+        5. MahalanobisLayer 経由で正例・負例それぞれの min-distance を計算
+        6. Youden's J 統計量で最適閾値を決定し、threshold バッファを更新
 
     Args:
         model:      FaceRecognitionModel（eval モードに切り替えて使用）
-        pos_loader: 正例 DataLoader（ラベル付き）
-        neg_loader: 負例 DataLoader（ラベルなし）
+        pos_loader: 正例 DataLoader（ラベル付き、labeled=True）
+        neg_loader: 負例 DataLoader（ラベルなし、labeled=False）
         device:     計算デバイス
-        reg_lambda: 共分散行列の対角正則化係数
+        reg_lambda: 共分散行列の対角正則化係数（相対スケーリングのベースライン）
 
     Returns:
         dict with keys: auc, threshold, pos_mean_dist, neg_mean_dist
     """
     model.eval()
 
-    # ── Step 1: 正例 embedding を収集 ──────────────────────────────────
-    print("  [Mahalanobis] Collecting positive embeddings...")
+    num_classes = model.mahal.num_classes
+    emb_size = model.mahal.emb_size
+
+    # ── Step 1: 正例 embedding とラベルを収集 ──────────────────────────
+    print("  [Mahalanobis] Collecting positive embeddings with labels...")
     pos_embeddings = []
+    pos_labels_list = []
     with torch.no_grad():
         for batch in tqdm(pos_loader, desc="  pos embed", leave=False):
-            # pos_loader は (imgs, labels) を返す
-            imgs = batch[0].to(device, non_blocking=True)
+            imgs, lbls = batch[0].to(device, non_blocking=True), batch[1]
             with torch.autocast(
                 device_type=device.type, enabled=USE_AMP, dtype=_AMP_TORCH_DTYPE
             ):
                 emb = model.embed(imgs)
             pos_embeddings.append(emb.float().cpu())
+            pos_labels_list.append(lbls)
     pos_emb = torch.cat(pos_embeddings, dim=0)  # (N_pos, D)
-    print(f"  [Mahalanobis] Positive embeddings: {pos_emb.shape}")
+    pos_labels = torch.cat(pos_labels_list, dim=0)  # (N_pos,)
+    print(
+        f"  [Mahalanobis] Positive embeddings: {pos_emb.shape}, classes: {num_classes}"
+    )
 
-    # ── Step 2: 平均・共分散・精度行列の計算 ────────────────────────────
-    # NOTE: float32 で 51k × 512 の外積を累積すると丸め誤差が 51k 倍蓄積し、
-    #       共分散行列の条件数が 1e8 を超えると逆行列が NaN になる。
-    #       float64 で計算することで機械イプシロンを ~1e-7 → ~2e-16 に改善する。
-    print("  [Mahalanobis] Computing mean and precision matrix (float64)...")
+    # ── Step 2: クラスごとの平均を計算 ──────────────────────────────────
+    # NOTE: float64 で計算することで大規模な累積丸め誤差を抑制する。
+    print("  [Mahalanobis] Computing per-class means (float64)...")
     pos_emb64 = pos_emb.double()  # float32 → float64
-    mu = pos_emb64.mean(dim=0)  # (D,) float64
+    class_means64 = torch.zeros(num_classes, emb_size, dtype=torch.float64)
+    class_counts = torch.zeros(num_classes, dtype=torch.long)
 
-    # 共分散行列: (N, D) の中心化データから計算
-    centered = pos_emb64 - mu.unsqueeze(0)  # (N, D) float64
-    n = centered.shape[0]
-    cov = (centered.T @ centered) / (n - 1)  # (D, D) float64
+    for c in range(num_classes):
+        mask = pos_labels == c
+        if mask.sum() > 0:
+            class_means64[c] = pos_emb64[mask].mean(dim=0)
+            class_counts[c] = mask.sum()
 
-    # λ を共分散の平均分散 (trace/D) に対して相対スケーリングする。
-    # 固定値 1e-5 は embedding の分散スケールに依存して効かないことがある。
-    # λ = trace(Σ)/D × 1e-3 は「平均分散の 0.1%」を下限として保証する。
-    trace_mean = cov.diagonal().mean().item()
+    n_empty = int((class_counts == 0).sum())
+    if n_empty > 0:
+        print(
+            f"  [Mahalanobis] WARNING: {n_empty} classes have no samples; "
+            f"their means remain zero."
+        )
+
+    # ── Step 3: Pooled within-class 共分散行列を計算 ────────────────────
+    # S_w = Σ_c Σ_{x in c} (x - μ_c)(x - μ_c)^T / (N - C)
+    # クラスごとに中心化して累積することで、クラス間の分散（クラスセントロイド間の分散）
+    # を除去する。これにより ArcFace 特徴空間でも正常なクラス内分散が得られる。
+    print("  [Mahalanobis] Computing pooled within-class covariance (float64)...")
+    n_total = pos_emb64.shape[0]
+    n_nonempty_classes = int((class_counts > 0).sum())
+    dof = max(n_total - n_nonempty_classes, 1)  # 自由度 (N - C)
+
+    # 各サンプルをそのクラス平均で中心化する
+    class_mean_per_sample = class_means64[pos_labels.long()]  # (N_pos, D)
+    centered = pos_emb64 - class_mean_per_sample  # (N_pos, D)
+    cov_w = (centered.T @ centered) / dof  # (D, D) float64
+
+    # 正則化: λ = trace(Σ_w)/D × 1e-3 (「平均クラス内分散の 0.1%」を下限保証)
+    trace_mean = cov_w.diagonal().mean().item()
     adaptive_lambda = max(trace_mean * 1e-3, reg_lambda)
-    print(f"  [Mahalanobis] trace/D={trace_mean:.4g}, adaptive λ={adaptive_lambda:.4g}")
-    cov += adaptive_lambda * torch.eye(cov.shape[0], dtype=cov.dtype)
+    print(
+        f"  [Mahalanobis] within-class trace/D={trace_mean:.4g}, "
+        f"adaptive λ={adaptive_lambda:.4g}"
+    )
+    cov_w += adaptive_lambda * torch.eye(emb_size, dtype=torch.float64)
 
-    # 精度行列 Σ^{-1}: float64 で linalg.inv を実行し float32 に変換して保存
-    precision64 = torch.linalg.inv(cov)
+    # 精度行列 Σ_w^{-1}: float64 で計算し float32 に変換して保存
+    precision64 = torch.linalg.inv(cov_w)
     if not torch.isfinite(precision64).all():
         print(
             "  [Mahalanobis] linalg.inv returned non-finite values, falling back to pinv"
         )
-        precision64 = torch.linalg.pinv(cov)
+        precision64 = torch.linalg.pinv(cov_w)
     precision = precision64.float()  # float32 に戻してバッファへ書き込む
 
-    # ── Step 3: バッファを書き込んで MahalanobisLayer を使えるようにする ──
-    # 距離計算を MahalanobisLayer.forward() に委譲するため、先にバッファを更新する。
-    # Step 6 での再書き込みは不要になる（同じ値なので）。
-    model.mahal.mean.copy_(mu.to(device))
+    # ── Step 4: バッファを更新して MahalanobisLayer を使えるようにする ──
+    # class_means バッファのサイズが変化しないよう、同じ num_classes で初期化済み。
+    model.mahal.class_means.copy_(class_means64.float().to(device))
     model.mahal.precision.copy_(precision.to(device))
     print(
         "  [Mahalanobis] Buffers pre-loaded; computing distances via MahalanobisLayer..."
     )
 
-    # 正例距離
+    # 正例距離（min-distance to nearest class）
     pos_dists = []
     with torch.no_grad():
         for batch in tqdm(pos_loader, desc="  pos dist", leave=False):
@@ -477,7 +524,7 @@ def fit_mahalanobis(
             pos_dists.append(model.mahal(emb).cpu())
     pos_dists = torch.cat(pos_dists, dim=0).numpy()  # (N_pos,)
 
-    # ── Step 4: 負例のマハラノビス距離を計算 ────────────────────────────
+    # ── Step 5: 負例のマハラノビス距離を計算 ────────────────────────────
     # neg_loader は labeled=False の HuggingFaceFaceDataset を使用しているため、
     # batch は常に (imgs, -1) のタプルを返す。
     print("  [Mahalanobis] Collecting negative embeddings and computing distances...")
@@ -493,7 +540,7 @@ def fit_mahalanobis(
     neg_dists = torch.cat(neg_dists, dim=0).numpy()  # (N_neg,)
     print(f"  [Mahalanobis] Negative distances computed: {len(neg_dists)} samples")
 
-    # ── Step 5: AUC 計算と Youden's J で最適閾値を決定 ──────────────────
+    # ── Step 6: AUC 計算と Youden's J で最適閾値を決定 ──────────────────
     print("  [Mahalanobis] Computing AUC and optimal threshold (Youden's J)...")
     # ラベル: 正例=0 (normal), 負例=1 (anomaly)
     all_dists = np.concatenate([pos_dists, neg_dists])
@@ -534,8 +581,8 @@ def fit_mahalanobis(
         f"  [Mahalanobis] pos_mean_dist={pos_mean_dist:.4f}, neg_mean_dist={neg_mean_dist:.4f}"
     )
 
-    # ── Step 5: バッファに閾値を書き込んでフィット完了 ──────────────────
-    # mean / precision は Step 3 で書き込み済み。ここでは閾値のみ更新する。
+    # ── Step 7: バッファに閾値を書き込んでフィット完了 ──────────────────
+    # class_means / precision は Step 4 で書き込み済み。閾値のみ更新する。
     model.mahal.threshold.copy_(
         torch.tensor(optimal_threshold, dtype=torch.float32, device=device)
     )

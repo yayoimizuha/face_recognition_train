@@ -139,20 +139,25 @@ class ClassificationModel(_ClassificationBase):
 
 
 class ClassificationWithAnomalyModel(_ClassificationBase):
-    """backbone + GWAP + head + arc_weight + Mahalanobis → (logits, anomaly_score)."""
+    """backbone + GWAP + head + arc_weight + Mahalanobis → (logits, anomaly_score).
+
+    anomaly_score = min_c sqrt((raw_emb - μ_c)^T Σ_w^{-1} (raw_emb - μ_c))
+    """
 
     def __init__(self, full_model: FaceRecognitionModel):
         super().__init__(full_model)
-        self.register_buffer("mahal_mean", full_model.mahal.mean.clone())
+        # class_means: (num_classes, D) — クラスごとの embedding 平均
+        self.register_buffer("mahal_class_means", full_model.mahal.class_means.clone())
         self.register_buffer("mahal_precision", full_model.mahal.precision.clone())
         self.register_buffer("mahal_threshold", full_model.mahal.threshold.clone())
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         raw_emb, logits = self._embed_and_classify(x)
-        diff = raw_emb - self.mahal_mean
-        left = diff @ self.mahal_precision
-        dist_sq = (left * diff).sum(dim=1).clamp(min=0.0)
-        anomaly_score = dist_sq.sqrt()
+        # diff: (B, 1, D) - (1, C, D) = (B, C, D)
+        diff = raw_emb.unsqueeze(1) - self.mahal_class_means.unsqueeze(0)
+        left = diff @ self.mahal_precision  # (B, C, D)
+        dist_sq = (left * diff).sum(dim=2).clamp(min=0.0)  # (B, C)
+        anomaly_score = dist_sq.min(dim=1).values.sqrt()  # (B,)
         return logits, anomaly_score
 
 

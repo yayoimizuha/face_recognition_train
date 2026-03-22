@@ -227,7 +227,7 @@ def get_mahal_initializer_names(model: onnx.ModelProto) -> set[str]:
     """Return names of Mahalanobis-related initializers.
 
     These should be excluded from reduced-precision conversion to maintain
-    anomaly detection accuracy.  Includes ``mahal_mean``, ``mahal_precision``,
+    anomaly detection accuracy.  Includes ``mahal_class_means``, ``mahal_precision``,
     and ``mahal_threshold``.
     """
     names: set[str] = set()
@@ -244,19 +244,19 @@ def restore_mahal_initializers_to_fp32(
     model: onnx.ModelProto,
     fp32_model: onnx.ModelProto,
 ) -> int:
-    """Restore ``mahal_mean`` and ``mahal_precision`` initializers to fp32.
+    """Restore ``mahal_class_means`` and ``mahal_precision`` initializers to fp32.
 
     After fp16/bf16 conversion these buffers may be clipped or lose precision,
     causing the Mahalanobis distance to overflow / underflow.  This function
     replaces them with the original fp32 values.
 
-    Returns the number of initializers restored (0–2).
+    Returns the number of initializers restored.
     """
     fp32_inits = {
         init.name: onnx_numpy_helper.to_array(init)
         for init in fp32_model.graph.initializer
     }
-    mahal_names = {"mahal_mean", "mahal_precision"}
+    mahal_names = {"mahal_class_means", "mahal_precision"}
     count = 0
     for i, init in enumerate(model.graph.initializer):
         if init.name in mahal_names and init.name in fp32_inits:
@@ -282,7 +282,7 @@ def convert_graph_to_fp16(
 
     When ``has_mahal=True``:
     - Mahalanobis-exclusive nodes are kept in fp32 via ``node_block_list``
-    - ``mahal_mean`` / ``mahal_precision`` initializers are restored to fp32
+    - ``mahal_class_means`` / ``mahal_precision`` initializers are restored to fp32
 
     Args:
         fp32_model: Original fp32 model (not modified).
@@ -334,7 +334,7 @@ def convert_graph_to_bf16(
     relative error per element.
 
     When ``has_mahal=True``:
-    - ``mahal_mean`` / ``mahal_precision`` are restored to fp32
+    - ``mahal_class_means`` / ``mahal_precision`` are restored to fp32
 
     Args:
         fp32_model: Original fp32 model (not modified).
