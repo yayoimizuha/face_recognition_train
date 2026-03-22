@@ -12,7 +12,7 @@ dependencies = [
     "torchvision~=0.23",
     "scikit-learn~=1.7",
     "scikit-image~=0.25",
-    "onnxruntime-gpu~=1.23",
+    "onnxruntime-gpu~=1.24",
     "onnx~=1.19",
     "pandas~=2.3",
     "opencv-python~=4.11",
@@ -32,7 +32,11 @@ dependencies = [
     "schedulefree~=1.4",
     "torch-optimizer~=0.3",
     "torchinfo~=1.8",
-#    "intel-extension-for-pytorch"
+    #    "intel-extension-for-pytorch"
+    "matplotlib-fontja>=1.1.0",
+    "onnxscript>=0.6.2",
+    "neural-compressor>=2.4.1",
+    "onnxconverter-common>=1.16.0",
 ]
 
 [[tool.uv.index]]
