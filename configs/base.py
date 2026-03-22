@@ -80,5 +80,5 @@ config.wandb_resume = False  # resume wandb run: Only if the you wand t resume t
 config.notes = "Training various FaceNets with new codebase and dataset and algorithms."
 
 
-config.rec = "/home/apacsc14/Glint360k"
-config.val_dir = "/home/apacsc14/face_valid"
+config.rec = "/mnt/nvme/Glint360k_WebDataset"
+config.val_dir = "/mnt/nvme/data1"
