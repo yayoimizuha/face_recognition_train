@@ -32,6 +32,6 @@ config.dataset_type = "webdataset"
 # Glint360k のクラス数と画像枚数（スケジューラ計算用）
 config.num_classes = 360232
 config.num_image = 17091657
-config.num_epoch = 300
+config.num_epoch = 60
 config.warmup_epoch = 2
 config.val_targets = ["lfw", "cfp_fp", "agedb_30"]
